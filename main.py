@@ -89,9 +89,11 @@ async def get_video_info(req: VideoRequest, request: Request):
             "no_warnings": True,
             "extract_flat": False,
             "nocheckcertificate": True,
+            "socket_timeout": 15,
+            "retries": 3,
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "ios"],
+                    "player_client": ["android", "ios", "tv", "mweb", "web"],
                 }
             }
         }
@@ -277,9 +279,11 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 "no_warnings": True,
                 "concurrent_fragment_downloads": 5,
                 "nocheckcertificate": True,
+                "socket_timeout": 15,
+                "retries": 3,
                 "extractor_args": {
                     "youtube": {
-                        "player_client": ["android", "ios"],
+                        "player_client": ["android", "ios", "tv", "mweb", "web"],
                     }
                 },
                 "postprocessor_args": {
@@ -303,9 +307,11 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 "no_warnings": True,
                 "concurrent_fragment_downloads": 5,
                 "nocheckcertificate": True,
+                "socket_timeout": 15,
+                "retries": 3,
                 "extractor_args": {
                     "youtube": {
-                        "player_client": ["android", "ios"],
+                        "player_client": ["android", "ios", "tv", "mweb", "web"],
                     }
                 },
                 "postprocessor_args": {
@@ -447,13 +453,15 @@ async def submit_dmca(req: DmcaRequest, request: Request):
 async def test_ytdl(url: str):
     results = {}
     
-    # Test 1: Default ytdl_opts
+    # Test 1: Default ytdl_opts with timeout
     try:
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
             "no_warnings": True,
             "nocheckcertificate": True,
+            "socket_timeout": 8,
+            "retries": 1,
         }
         def t1():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -463,13 +471,15 @@ async def test_ytdl(url: str):
     except Exception as e:
         results["default"] = {"success": False, "error": str(e)}
 
-    # Test 2: With TV client only
+    # Test 2: With TV client only and timeout
     try:
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
             "no_warnings": True,
             "nocheckcertificate": True,
+            "socket_timeout": 8,
+            "retries": 1,
             "extractor_args": {
                 "youtube": {
                     "player_client": ["tv"],
@@ -484,13 +494,15 @@ async def test_ytdl(url: str):
     except Exception as e:
         results["tv_client"] = {"success": False, "error": str(e)}
 
-    # Test 3: With Android/iOS client
+    # Test 3: With Android/iOS client and timeout
     try:
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
             "no_warnings": True,
             "nocheckcertificate": True,
+            "socket_timeout": 8,
+            "retries": 1,
             "extractor_args": {
                 "youtube": {
                     "player_client": ["android", "ios"],
@@ -505,13 +517,15 @@ async def test_ytdl(url: str):
     except Exception as e:
         results["android_ios"] = {"success": False, "error": str(e)}
 
-    # Test 4: With all clients (android, ios, tv, mweb, web)
+    # Test 4: With all clients (android, ios, tv, mweb, web) and timeout
     try:
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
             "no_warnings": True,
             "nocheckcertificate": True,
+            "socket_timeout": 8,
+            "retries": 1,
             "extractor_args": {
                 "youtube": {
                     "player_client": ["android", "ios", "tv", "mweb", "web"],
