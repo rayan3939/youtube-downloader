@@ -75,43 +75,54 @@ class RouteManager:
         if not self.nodes:
             return None
         
-        sample = random.sample(self.nodes, min(len(self.nodes), 150))
-        logger.info(f"Verifying {len(sample)} route nodes...")
+        sample = random.sample(self.nodes, min(len(self.nodes), 100))
+        logger.info(f"Verifying {len(sample)} route nodes in batches...")
         
-        limits = httpx.Limits(max_connections=200, max_keepalive_connections=50)
+        limits = httpx.Limits(max_connections=35, max_keepalive_connections=10)
         
-        async def test_node(node):
-            try:
-                client_kwargs = {
-                    "timeout": 4.5,
-                    "limits": limits,
-                    "pr" + "oxy": node
-                }
-                async with httpx.AsyncClient(**client_kwargs) as client:
-                    target = b64_decode_str("aHR0cHM6Ly93d3cuZ29vZ2xlLmNvbQ==")
-                    res = await client.get(target, follow_redirects=True)
-                    if res.status_code == 200:
-                        return node
-            except Exception:
-                pass
-            return None
-
-        # Check concurrently
-        tasks = [asyncio.create_task(test_node(n)) for n in sample]
-        
+        batch_size = 25
         working_node = None
-        for next_task in asyncio.as_completed(tasks):
-            try:
-                res = await next_task
-                if res:
-                    working_node = res
-                    for t in tasks:
-                        t.cancel()
-                    break
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
+        
+        for i in range(0, len(sample), batch_size):
+            batch = sample[i:i+batch_size]
+            logger.info(f"Testing batch of {len(batch)} nodes concurrently...")
+            
+            async def test_node(node):
+                try:
+                    client_kwargs = {
+                        "timeout": 4.0,
+                        "limits": limits,
+                        "pr" + "oxy": node
+                    }
+                    async with httpx.AsyncClient(**client_kwargs) as client:
+                        target = b64_decode_str("aHR0cHM6Ly93d3cuZ29vZ2xlLmNvbQ==")
+                        res = await client.get(target, follow_redirects=True)
+                        if res.status_code == 200:
+                            return node
+                except Exception:
+                    pass
+                return None
+
+            # Run batch concurrently
+            tasks = [asyncio.create_task(test_node(n)) for n in batch]
+            
+            # Process as they complete
+            for next_task in asyncio.as_completed(tasks):
+                try:
+                    res = await next_task
+                    if res:
+                        working_node = res
+                        # Cancel remaining tasks in this batch
+                        for t in tasks:
+                            t.cancel()
+                        break
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            
+            if working_node:
+                break
         
         if working_node:
             logger.info("Found verified route node.")
