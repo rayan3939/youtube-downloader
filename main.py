@@ -17,6 +17,101 @@ import asyncio
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+import httpx
+import random
+import time
+
+class ProxyRotator:
+    def __init__(self):
+        self.proxies = []
+        self.last_fetch = 0
+        self.lock = asyncio.Lock()
+
+    async def fetch_proxies(self):
+        async with self.lock:
+            # Refresh every 10 minutes
+            if time.time() - self.last_fetch < 600 and self.proxies:
+                return
+            
+            logger.info("Fetching fresh free proxies list...")
+            urls = [
+                ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all", "http"),
+                ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "http"),
+                ("https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "http"),
+                ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all", "socks5"),
+                ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", "socks5"),
+                ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=all", "socks4"),
+                ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt", "socks4")
+            ]
+            
+            new_proxies = set()
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                for url, protocol in urls:
+                    try:
+                        res = await client.get(url)
+                        if res.status_code == 200:
+                            for line in res.text.splitlines():
+                                line = line.strip()
+                                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$', line):
+                                    new_proxies.add(f"{protocol}://{line}")
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch proxies from {url}: {e}")
+            
+            if new_proxies:
+                self.proxies = list(new_proxies)
+                self.last_fetch = time.time()
+                logger.info(f"Loaded {len(self.proxies)} free proxies (HTTP & SOCKS).")
+            else:
+                logger.warning("No free proxies could be loaded. Will use direct connection.")
+
+    async def get_working_proxy(self):
+        await self.fetch_proxies()
+        if not self.proxies:
+            return None
+        
+        sample = random.sample(self.proxies, min(len(self.proxies), 150))
+        logger.info(f"Testing a sample of {len(sample)} proxies concurrently against Google/YouTube...")
+        
+        limits = httpx.Limits(max_connections=200, max_keepalive_connections=50)
+        
+        async def test_proxy(proxy):
+            try:
+                # 4.5s timeout is standard for free proxies to establish TLS handshakes
+                async with httpx.AsyncClient(proxy=proxy, timeout=4.5, limits=limits) as client:
+                    res = await client.get("https://www.google.com", follow_redirects=True)
+                    if res.status_code == 200:
+                        return proxy
+            except Exception:
+                pass
+            return None
+
+        # Run tasks concurrently
+        tasks = [asyncio.create_task(test_proxy(p)) for p in sample]
+        
+        working_proxy = None
+        for next_task in asyncio.as_completed(tasks):
+            try:
+                res = await next_task
+                if res:
+                    working_proxy = res
+                    # Cancel remaining tasks to save bandwidth
+                    for t in tasks:
+                        t.cancel()
+                    break
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        
+        if working_proxy:
+            logger.info(f"Verified working proxy found: {working_proxy}")
+            return working_proxy
+            
+        logger.warning("No verified working proxies found in this batch. Falling back to direct connection.")
+        return None
+
+proxy_rotator = ProxyRotator()
+
 # Initialize rate limiter
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Agency Downloader API", version="1.0.0")
@@ -83,6 +178,7 @@ async def health_check():
 async def get_video_info(req: VideoRequest, request: Request):
     """Fetch video metadata and format choices without downloading."""
     try:
+        proxy = await proxy_rotator.get_working_proxy()
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
@@ -91,12 +187,9 @@ async def get_video_info(req: VideoRequest, request: Request):
             "nocheckcertificate": True,
             "socket_timeout": 15,
             "retries": 3,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "ios", "tv", "mweb", "web"],
-                }
-            }
         }
+        if proxy:
+            ydl_opts["proxy"] = proxy
         
         def run_info():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -125,57 +218,72 @@ async def get_video_info(req: VideoRequest, request: Request):
         if best_audio_size == 0 and duration > 0:
             best_audio_size = int((best_audio_tbr * 1000 / 8) * duration)
 
-        # Group formats by height, keeping the highest quality stream for size estimation
+        # Group formats by snapped standard height to prevent duplicates and clean up labels
         height_formats = {}
+        
+        standards = [
+            (4320, "8K Ultra HD"),
+            (2160, "4K Ultra HD"),
+            (1440, "2K"),
+            (1080, "Full HD"),
+            (720, "HD"),
+            (480, ""),
+            (360, ""),
+            (240, ""),
+            (144, "")
+        ]
+        
         for f in info.get("formats", []):
             height = f.get("height")
             if height and f.get("vcodec") != "none":
+                # Find the standard snapped height (e.g. 1074 -> 1080)
+                best_std, tag = min(standards, key=lambda x: abs(x[0] - height))
+                
+                # Use standard if within 25% threshold, otherwise keep raw height as bucket
+                bucket_height = best_std if abs(best_std - height) <= 0.25 * best_std else height
+                
                 # Estimate video stream size
                 vsize = f.get("filesize") or f.get("filesize_approx") or 0
                 tbr = f.get("tbr")
-                
-                # If size is missing but bitrate (tbr) and duration are present, calculate size
                 if vsize == 0 and tbr and duration > 0:
                     vsize = int((tbr * 1000 / 8) * duration)
                 
                 total_size = vsize
-                # If format is video-only, add the best audio size
                 if f.get("acodec") == "none":
                     total_size += best_audio_size
 
-                # Secondary fallback if both size and tbr are missing
                 if total_size == 0 and duration > 0:
                     bitrate_map = {
-                        4320: 30000 * 1024 / 8,  # 30 Mbps
-                        2160: 15000 * 1024 / 8,  # 15 Mbps
-                        1440: 6000 * 1024 / 8,   # 6 Mbps
-                        1080: 3000 * 1024 / 8,   # 3 Mbps
-                        720: 1500 * 1024 / 8,    # 1.5 Mbps
-                        480: 800 * 1024 / 8,     # 800 Kbps
-                        360: 400 * 1024 / 8,     # 400 Kbps
-                        240: 250 * 1024 / 8,     # 250 Kbps
-                        144: 100 * 1024 / 8,     # 100 Kbps
+                        4320: 30000 * 1024 / 8,
+                        2160: 15000 * 1024 / 8,
+                        1440: 6000 * 1024 / 8,
+                        1080: 3000 * 1024 / 8,
+                        720: 1500 * 1024 / 8,
+                        480: 800 * 1024 / 8,
+                        360: 400 * 1024 / 8,
+                        240: 250 * 1024 / 8,
+                        144: 100 * 1024 / 8,
                     }
-                    bitrate = bitrate_map.get(height, 1000 * 1024 / 8)
+                    bitrate = bitrate_map.get(bucket_height, 1000 * 1024 / 8)
                     total_size = int(bitrate * duration)
 
-                # Keep the format with the largest size/bitrate for this resolution height
-                existing = height_formats.get(height)
+                # Keep the format with the largest size/bitrate for this bucket
+                existing = height_formats.get(bucket_height)
                 if not existing or total_size > existing["size"]:
-                    label = f"{height}p"
-                    if height == 4320:
+                    label = f"{bucket_height}p"
+                    if bucket_height == 4320:
                         label += " (8K Ultra HD)"
-                    elif height == 2160:
+                    elif bucket_height == 2160:
                         label += " (4K Ultra HD)"
-                    elif height == 1440:
+                    elif bucket_height == 1440:
                         label += " (2K)"
-                    elif height == 1080:
+                    elif bucket_height == 1080:
                         label += " (Full HD)"
-                    elif height == 720:
+                    elif bucket_height == 720:
                         label += " (HD)"
-
-                    height_formats[height] = {
-                        "quality": str(height),
+                    
+                    height_formats[bucket_height] = {
+                        "quality": str(height),  # Use raw height internally to select the correct stream
                         "label": label,
                         "ext": "mp4",
                         "size": total_size
@@ -195,6 +303,23 @@ async def get_video_info(req: VideoRequest, request: Request):
     except Exception as e:
         logger.error(f"Error fetching info: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to fetch video information: {str(e)}")
+
+@app.get("/api/download")
+@limiter.limit("10/minute")
+async def download_video_get(
+    url: str,
+    format: str,
+    quality: str,
+    download_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks
+):
+    """GET endpoint for downloading/streaming media (highly compatible with mobile browsers)."""
+    try:
+        req = DownloadRequest(url=url, format=format, quality=quality, download_id=download_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return await download_video(req, request, background_tasks)
 
 @app.post("/api/download")
 @limiter.limit("10/minute")
@@ -266,6 +391,9 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         # Initialize progress store entry
         progress_store[req.download_id] = {"status": "starting", "progress": 0}
 
+        # Fetch working proxy
+        proxy = await proxy_rotator.get_working_proxy()
+
         if req.format == "mp3":
             ydl_opts = {
                 "format": "bestaudio/best",
@@ -281,11 +409,6 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 "nocheckcertificate": True,
                 "socket_timeout": 15,
                 "retries": 3,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["android", "ios", "tv", "mweb", "web"],
-                    }
-                },
                 "postprocessor_args": {
                     "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
                 }
@@ -309,11 +432,6 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 "nocheckcertificate": True,
                 "socket_timeout": 15,
                 "retries": 3,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["android", "ios", "tv", "mweb", "web"],
-                    }
-                },
                 "postprocessor_args": {
                     "VideoConvertor+ffmpeg": [
                         "-threads", "4",
@@ -329,6 +447,9 @@ async def download_video(req: DownloadRequest, request: Request, background_task
             media_type = "video/mp4"
             filename_ext = "mp4"
         
+        if proxy:
+            ydl_opts["proxy"] = proxy
+
         # Attach the progress hook to options
         ydl_opts["progress_hooks"] = [make_progress_hook(req.download_id)]
         
@@ -368,7 +489,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         def iterfile():
             try:
                 with open(out_file, "rb") as f:
-                    while chunk := f.read(65536): # 64KB chunks
+                    while chunk := f.read(1048576): # 1MB chunks
                         yield chunk
             except Exception as e:
                 logger.error(f"Error during file streaming: {str(e)}")
