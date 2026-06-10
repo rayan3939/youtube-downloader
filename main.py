@@ -40,28 +40,50 @@ class RouteManager:
                 return
             
             logger.info("Updating router node pool...")
-            # Obfuscated list of tuples (base64 encoded url, protocol)
-            encoded_urls = [
-                ("aHR0cHM6Ly9hcGkucHJveHlzY3JhcGUuY29tL3YyLz9yZXF1ZXN0PWRpc3BsYXlwcm94aWVzJnByb3RvY29sPWh0dHAmdGltZW91dD0xMDAwMCZjb3VudHJ5PWFsbCZzc2w9YWxsJmFub255bWl0eT1hbGw=", "http"),
-                ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1RoZVNwZWVkWC9QUk9YWS1MaXN0L21hc3Rlci9odHRwLnR4dA==", "http"),
-                ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2NsYXJrZXRtL3Byb3h5LWxpc3QvbWFzdGVyL3Byb3h5LWxpc3QtcmF3LnR4dA==", "http")
-            ]
-            
             new_nodes = set()
-            async with httpx.AsyncClient(timeout=4.0) as client:
-                async def fetch_url(encoded_url, protocol):
-                    try:
-                        url = b64_decode_str(encoded_url)
-                        res = await client.get(url)
-                        if res.status_code == 200:
-                            for line in res.text.splitlines():
-                                line = line.strip()
-                                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$', line):
-                                    new_nodes.add(f"{protocol}://{line}")
-                    except Exception as e:
-                        logger.warning(f"Node sync warning for {protocol}: {e}")
+            
+            # 1. Try Geonode API first (very fast, recently checked active proxies)
+            try:
+                geonode_url = b64_decode_str("aHR0cHM6Ly9wcm94eWxpc3QuZ2Vvbm9kZS5jb20vYXBpL3Byb3h5LWxpc3Q/bGltaXQ9MTAwJnBhZ2U9MSZzb3J0X2J5PWxhc3RDaGVja2VkJnNvcnRfdHlwZT1kZXNjJnByb3RvY29scz1odHRwJTJDaHR0cHM=")
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    res = await client.get(geonode_url)
+                    if res.status_code == 200:
+                        data = res.json().get("data", [])
+                        for item in data:
+                            ip = item.get("ip")
+                            port = item.get("port")
+                            protocols = item.get("protocols", [])
+                            protocol = "http"
+                            if "https" in protocols:
+                                protocol = "https"
+                            if ip and port:
+                                new_nodes.add(f"{protocol}://{ip}:{port}")
+            except Exception as e:
+                logger.warning(f"Geonode sync warning: {e}")
+                
+            # 2. Try other scraper fallbacks if Geonode returned very few proxies
+            if len(new_nodes) < 20:
+                # Obfuscated list of tuples (base64 encoded url, protocol)
+                encoded_urls = [
+                    ("aHR0cHM6Ly9hcGkucHJveHlzY3JhcGUuY29tL3YyLz9yZXF1ZXN0PWRpc3BsYXlwcm94aWVzJnByb3RvY29sPWh0dHAmdGltZW91dD0xMDAwMCZjb3VudHJ5PWFsbCZzc2w9YWxsJmFub255bWl0eT1hbGw=", "http"),
+                    ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1RoZVNwZWVkWC9QUk9YWS1MaXN0L21hc3Rlci9odHRwLnR4dA==", "http"),
+                    ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2NsYXJrZXRtL3Byb3h5LWxpc3QvbWFzdGVyL3Byb3h5LWxpc3QtcmF3LnR4dA==", "http")
+                ]
+                
+                async with httpx.AsyncClient(timeout=4.0) as client:
+                    async def fetch_url(encoded_url, protocol):
+                        try:
+                            url = b64_decode_str(encoded_url)
+                            res = await client.get(url)
+                            if res.status_code == 200:
+                                for line in res.text.splitlines():
+                                    line = line.strip()
+                                    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$', line):
+                                        new_nodes.add(f"{protocol}://{line}")
+                        except Exception as e:
+                            logger.warning(f"Fallback sync warning for {protocol}: {e}")
 
-                await asyncio.gather(*(fetch_url(url, proto) for url, proto in encoded_urls))
+                    await asyncio.gather(*(fetch_url(url, proto) for url, proto in encoded_urls))
             
             if new_nodes:
                 self.nodes = list(new_nodes)
