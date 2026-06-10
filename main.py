@@ -22,6 +22,8 @@ import httpx
 import random
 import time
 
+IS_ON_CLOUD = os.environ.get("SPACE_ID") is not None or os.environ.get("RENDER") is not None
+
 def b64_decode_str(s):
     return base64.b64decode(s).decode("utf-8")
 
@@ -42,11 +44,7 @@ class RouteManager:
             encoded_urls = [
                 ("aHR0cHM6Ly9hcGkucHJveHlzY3JhcGUuY29tL3YyLz9yZXF1ZXN0PWRpc3BsYXlwcm94aWVzJnByb3RvY29sPWh0dHAmdGltZW91dD0xMDAwMCZjb3VudHJ5PWFsbCZzc2w9YWxsJmFub255bWl0eT1hbGw=", "http"),
                 ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1RoZVNwZWVkWC9QUk9YWS1MaXN0L21hc3Rlci9odHRwLnR4dA==", "http"),
-                ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2NsYXJrZXRtL3Byb3h5LWxpc3QvbWFzdGVyL3Byb3h5LWxpc3QtcmF3LnR4dA==", "http"),
-                ("aHR0cHM6Ly9hcGkucHJveHlzY3JhcGUuY29tL3YyLz9yZXF1ZXN0PWRpc3BsYXlwcm94aWVzJnByb3RvY29sPXNvY2tzNSZ0aW1lb3V0PTEwMDAwJmNvdW50cnk9YWxs", "socks5"),
-                ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1RoZVNwZWVkWC9QUk9YWS1MaXN0L21hc3Rlci9zb2NrczUudHh0", "socks5"),
-                ("aHR0cHM6Ly9hcGkucHJveHlzY3JhcGUuY29tL3YyLz9yZXF1ZXN0PWRpc3BsYXlwcm94aWVzJnByb3RvY29sPXNvY2tzNCZ0aW1lb3V0PTEwMDAwJmNvdW50cnk9YWxs", "socks4"),
-                ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1RoZVNwZWVkWC9QUk9YWS1MaXN0L21hc3Rlci9zb2NrczQudHh0", "socks4")
+                ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2NsYXJrZXRtL3Byb3h5LWxpc3QvbWFzdGVyL3Byb3h5LWxpc3QtcmF3LnR4dA==", "http")
             ]
             
             new_nodes = set()
@@ -200,6 +198,12 @@ async def get_video_info(req: VideoRequest, request: Request):
     """Fetch video metadata and format choices without downloading."""
     try:
         node = await router_pool.get_active_node()
+        if not node and IS_ON_CLOUD:
+            raise HTTPException(
+                status_code=503,
+                detail="All download nodes are currently busy or offline. Please retry in a few seconds."
+            )
+            
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
@@ -414,6 +418,11 @@ async def download_video(req: DownloadRequest, request: Request, background_task
 
         # Fetch active node
         node = await router_pool.get_active_node()
+        if not node and IS_ON_CLOUD:
+            raise HTTPException(
+                status_code=503,
+                detail="All download nodes are currently busy or offline. Please retry in a few seconds."
+            )
 
         if req.format == "mp3":
             ydl_opts = {
