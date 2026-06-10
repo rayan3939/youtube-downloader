@@ -88,6 +88,7 @@ async def get_video_info(req: VideoRequest, request: Request):
             "skip_download": True,
             "no_warnings": True,
             "extract_flat": False,
+            "nocheckcertificate": True,
         }
         
         def run_info():
@@ -270,6 +271,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 "quiet": True,
                 "no_warnings": True,
                 "concurrent_fragment_downloads": 5,
+                "nocheckcertificate": True,
                 "postprocessor_args": {
                     "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
                 }
@@ -290,6 +292,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 "quiet": True,
                 "no_warnings": True,
                 "concurrent_fragment_downloads": 5,
+                "nocheckcertificate": True,
                 "postprocessor_args": {
                     "VideoConvertor+ffmpeg": [
                         "-threads", "4",
