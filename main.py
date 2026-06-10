@@ -48,8 +48,8 @@ class RouteManager:
             ]
             
             new_nodes = set()
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                for encoded_url, protocol in encoded_urls:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                async def fetch_url(encoded_url, protocol):
                     try:
                         url = b64_decode_str(encoded_url)
                         res = await client.get(url)
@@ -60,6 +60,8 @@ class RouteManager:
                                     new_nodes.add(f"{protocol}://{line}")
                     except Exception as e:
                         logger.warning(f"Node sync warning for {protocol}: {e}")
+
+                await asyncio.gather(*(fetch_url(url, proto) for url, proto in encoded_urls))
             
             if new_nodes:
                 self.nodes = list(new_nodes)
@@ -73,7 +75,7 @@ class RouteManager:
         if not self.nodes:
             return None
         
-        sample = random.sample(self.nodes, min(len(self.nodes), 100))
+        sample = random.sample(self.nodes, min(len(self.nodes), 50))
         logger.info(f"Verifying {len(sample)} route nodes in batches...")
         
         limits = httpx.Limits(max_connections=35, max_keepalive_connections=10)
@@ -219,6 +221,7 @@ async def get_video_info(req: VideoRequest, request: Request):
                 "nocheckcertificate": True,
                 "socket_timeout": 8,  # Fast timeout for metadata fetch
                 "retries": 1,
+                "js_runtimes": ["node"],
                 "extractor_args": {
                     "youtube": {
                         "player_client": ["tv"],
@@ -474,6 +477,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                     "nocheckcertificate": True,
                     "socket_timeout": 30,
                     "retries": 3,
+                    "js_runtimes": ["node"],
                     "postprocessor_args": {
                         "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
                     },
@@ -502,6 +506,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                     "nocheckcertificate": True,
                     "socket_timeout": 30,
                     "retries": 3,
+                    "js_runtimes": ["node"],
                     "postprocessor_args": {
                         "VideoConvertor+ffmpeg": [
                             "-threads", "4",
