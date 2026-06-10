@@ -88,12 +88,12 @@ class RouteManager:
             async def test_node(node):
                 try:
                     client_kwargs = {
-                        "timeout": 4.0,
+                        "timeout": 3.0,
                         "limits": limits,
                         "pr" + "oxy": node
                     }
                     async with httpx.AsyncClient(**client_kwargs) as client:
-                        target = b64_decode_str("aHR0cHM6Ly93d3cuZ29vZ2xlLmNvbQ==")
+                        target = b64_decode_str("aHR0cHM6Ly93d3cueW91dHViZS5jb20vaWZyYW1lX2FwaQ==")
                         res = await client.get(target, follow_redirects=True)
                         if res.status_code == 200:
                             return node
@@ -197,38 +197,60 @@ async def health_check():
 async def get_video_info(req: VideoRequest, request: Request):
     """Fetch video metadata and format choices without downloading."""
     try:
-        node = await router_pool.get_active_node()
-        if not node and IS_ON_CLOUD:
-            raise HTTPException(
-                status_code=503,
-                detail="All download nodes are currently busy or offline. Please retry in a few seconds."
-            )
-            
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "no_warnings": True,
-            "extract_flat": False,
-            "nocheckcertificate": True,
-            "socket_timeout": 30,
-            "retries": 3,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["tv"],
+        info = None
+        last_error = None
+        
+        # Try up to 3 different verified nodes
+        for attempt in range(3):
+            node = await router_pool.get_active_node()
+            if not node and IS_ON_CLOUD:
+                if attempt > 0:
+                    break
+                raise HTTPException(
+                    status_code=503,
+                    detail="All download nodes are currently busy or offline. Please retry in a few seconds."
+                )
+                
+            ydl_opts = {
+                "quiet": True,
+                "skip_download": True,
+                "no_warnings": True,
+                "extract_flat": False,
+                "nocheckcertificate": True,
+                "socket_timeout": 8,  # Fast timeout for metadata fetch
+                "retries": 1,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["tv"],
+                    }
                 }
             }
-        }
-        if node:
-            ydl_opts["pr" + "oxy"] = node
-        
-        def run_info():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(req.url, download=False)
+            if node:
+                ydl_opts["pr" + "oxy"] = node
                 
-        info = await asyncio.to_thread(run_info)
-        
+            logger.info(f"Attempt {attempt + 1}: Fetching info using node {node}")
+            
+            def run_info():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(req.url, download=False)
+                    
+            try:
+                info = await asyncio.to_thread(run_info)
+                if info:
+                    break
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Attempt {attempt + 1} failed with node {node}: {last_error}")
+                # Remove bad node
+                if node and node in router_pool.nodes:
+                    try:
+                        router_pool.nodes.remove(node)
+                        logger.info(f"Removed bad node {node} from pool. Remaining: {len(router_pool.nodes)}")
+                    except Exception:
+                        pass
+                        
         if not info:
-            raise HTTPException(status_code=400, detail="Could not extract video information.")
+            raise Exception(f"No working connection nodes. Last error: {last_error}")
 
         # Get duration for size estimation
         duration = info.get("duration", 0)
@@ -421,90 +443,118 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         # Initialize progress store entry
         progress_store[req.download_id] = {"status": "starting", "progress": 0}
 
-        # Fetch active node
-        node = await router_pool.get_active_node()
-        if not node and IS_ON_CLOUD:
+        info = None
+        last_error = None
+        out_file = None
+        media_type = None
+        filename_ext = None
+        
+        for attempt in range(2):
+            node = await router_pool.get_active_node()
+            if not node and IS_ON_CLOUD:
+                if attempt > 0:
+                    break
+                raise HTTPException(
+                    status_code=503,
+                    detail="All download nodes are currently busy or offline. Please retry in a few seconds."
+                )
+
+            if req.format == "mp3":
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": tmp_path + ".%(ext)s",
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": req.quality,
+                    }],
+                    "quiet": True,
+                    "no_warnings": True,
+                    "concurrent_fragment_downloads": 5,
+                    "nocheckcertificate": True,
+                    "socket_timeout": 30,
+                    "retries": 3,
+                    "postprocessor_args": {
+                        "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
+                    },
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["tv"],
+                        }
+                    }
+                }
+                out_file = tmp_path + ".mp3"
+                media_type = "audio/mpeg"
+                filename_ext = "mp3"
+            else:
+                # We prioritize downloading compatible MP4 (H264) and M4A (AAC) streams.
+                # If compatible streams are found, they are merged instantly (under 1 second) with no transcoding.
+                # If not found (e.g. for resolutions above 1080p), we fall back to best video and audio
+                # and transcode to high-quality compatible MP4.
+                ydl_opts = {
+                    "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best",
+                    "outtmpl": tmp_path + ".%(ext)s",
+                    "merge_output_format": "mp4",
+                    "recode_video": "mp4",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "concurrent_fragment_downloads": 5,
+                    "nocheckcertificate": True,
+                    "socket_timeout": 30,
+                    "retries": 3,
+                    "postprocessor_args": {
+                        "VideoConvertor+ffmpeg": [
+                            "-threads", "4",
+                            "-c:v", "libx264",
+                            "-crf", "20",      # visually lossless compression
+                            "-preset", "ultrafast",
+                            "-c:a", "aac",
+                            "-b:a", "192k"     # high quality audio
+                        ]
+                    },
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["tv"],
+                        }
+                    }
+                }
+                out_file = tmp_path + ".mp4"
+                media_type = "video/mp4"
+                filename_ext = "mp4"
+            
+            if node:
+                ydl_opts["pr" + "oxy"] = node
+
+            # Attach the progress hook to options
+            ydl_opts["progress_hooks"] = [make_progress_hook(req.download_id)]
+            
+            logger.info(f"Download attempt {attempt + 1}: starting using node {node}")
+            
+            def run_download():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(req.url, download=True)
+                    
+            try:
+                info = await asyncio.to_thread(run_download)
+                if info:
+                    break
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Download attempt {attempt + 1} failed with node {node}: {last_error}")
+                # Clean up any partial files from this failed download attempt
+                cleanup_temp_files_by_id(tmp_dir, tmp_id)
+                # Remove bad node
+                if node and node in router_pool.nodes:
+                    try:
+                        router_pool.nodes.remove(node)
+                    except Exception:
+                        pass
+        else:
             raise HTTPException(
-                status_code=503,
-                detail="All download nodes are currently busy or offline. Please retry in a few seconds."
+                status_code=400,
+                detail=f"Download failed after multiple attempts: {last_error or 'No working connection nodes'}"
             )
 
-        if req.format == "mp3":
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": tmp_path + ".%(ext)s",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": req.quality,
-                }],
-                "quiet": True,
-                "no_warnings": True,
-                "concurrent_fragment_downloads": 5,
-                "nocheckcertificate": True,
-                "socket_timeout": 30,
-                "retries": 3,
-                "postprocessor_args": {
-                    "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
-                },
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["tv"],
-                    }
-                }
-            }
-            out_file = tmp_path + ".mp3"
-            media_type = "audio/mpeg"
-            filename_ext = "mp3"
-        else:
-            # We prioritize downloading compatible MP4 (H264) and M4A (AAC) streams.
-            # If compatible streams are found, they are merged instantly (under 1 second) with no transcoding.
-            # If not found (e.g. for resolutions above 1080p), we fall back to best video and audio
-            # and transcode to high-quality compatible MP4.
-            ydl_opts = {
-                "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best",
-                "outtmpl": tmp_path + ".%(ext)s",
-                "merge_output_format": "mp4",
-                "recode_video": "mp4",
-                "quiet": True,
-                "no_warnings": True,
-                "concurrent_fragment_downloads": 5,
-                "nocheckcertificate": True,
-                "socket_timeout": 30,
-                "retries": 3,
-                "postprocessor_args": {
-                    "VideoConvertor+ffmpeg": [
-                        "-threads", "4",
-                        "-c:v", "libx264",
-                        "-crf", "20",      # visually lossless compression
-                        "-preset", "ultrafast",
-                        "-c:a", "aac",
-                        "-b:a", "192k"     # high quality audio
-                    ]
-                },
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["tv"],
-                    }
-                }
-            }
-            out_file = tmp_path + ".mp4"
-            media_type = "video/mp4"
-            filename_ext = "mp4"
-        
-        if node:
-            ydl_opts["pr" + "oxy"] = node
-
-        # Attach the progress hook to options
-        ydl_opts["progress_hooks"] = [make_progress_hook(req.download_id)]
-        
-        # Download video to the temporary path
-        # Download video to the temporary path in a separate thread so we don't block the event loop
-        def run_download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(req.url, download=True)
-                
-        info = await asyncio.to_thread(run_download)
         title = info.get("title", "video")
             
         # Update progress to streaming status
