@@ -210,8 +210,13 @@ async def get_video_info(req: VideoRequest, request: Request):
             "no_warnings": True,
             "extract_flat": False,
             "nocheckcertificate": True,
-            "socket_timeout": 15,
+            "socket_timeout": 30,
             "retries": 3,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv"],
+                }
+            }
         }
         if node:
             ydl_opts["pr" + "oxy"] = node
@@ -437,10 +442,15 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 "no_warnings": True,
                 "concurrent_fragment_downloads": 5,
                 "nocheckcertificate": True,
-                "socket_timeout": 15,
+                "socket_timeout": 30,
                 "retries": 3,
                 "postprocessor_args": {
                     "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
+                },
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["tv"],
+                    }
                 }
             }
             out_file = tmp_path + ".mp3"
@@ -460,7 +470,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 "no_warnings": True,
                 "concurrent_fragment_downloads": 5,
                 "nocheckcertificate": True,
-                "socket_timeout": 15,
+                "socket_timeout": 30,
                 "retries": 3,
                 "postprocessor_args": {
                     "VideoConvertor+ffmpeg": [
@@ -471,6 +481,11 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                         "-c:a", "aac",
                         "-b:a", "192k"     # high quality audio
                     ]
+                },
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["tv"],
+                    }
                 }
             }
             out_file = tmp_path + ".mp4"
