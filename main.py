@@ -442,3 +442,88 @@ class DmcaRequest(BaseModel):
 async def submit_dmca(req: DmcaRequest, request: Request):
     logger.info(f"DMCA Request received from {req.name} ({req.email}) for URL: {req.url}. Description: {req.description}")
     return {"status": "success", "message": "DMCA request submitted successfully. We will review it within 48 hours."}
+
+@app.get("/api/test")
+async def test_ytdl(url: str):
+    results = {}
+    
+    # Test 1: Default ytdl_opts
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+        }
+        def t1():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        info = await asyncio.to_thread(t1)
+        results["default"] = {"success": True, "formats": len(info.get("formats", []))}
+    except Exception as e:
+        results["default"] = {"success": False, "error": str(e)}
+
+    # Test 2: With TV client only
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv"],
+                }
+            }
+        }
+        def t2():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        info = await asyncio.to_thread(t2)
+        results["tv_client"] = {"success": True, "formats": len(info.get("formats", []))}
+    except Exception as e:
+        results["tv_client"] = {"success": False, "error": str(e)}
+
+    # Test 3: With Android/iOS client
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios"],
+                }
+            }
+        }
+        def t3():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        info = await asyncio.to_thread(t3)
+        results["android_ios"] = {"success": True, "formats": len(info.get("formats", []))}
+    except Exception as e:
+        results["android_ios"] = {"success": False, "error": str(e)}
+
+    # Test 4: With all clients (android, ios, tv, mweb, web)
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios", "tv", "mweb", "web"],
+                }
+            }
+        }
+        def t4():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        info = await asyncio.to_thread(t4)
+        results["all_clients"] = {"success": True, "formats": len(info.get("formats", []))}
+    except Exception as e:
+        results["all_clients"] = {"success": False, "error": str(e)}
+
+    return results
