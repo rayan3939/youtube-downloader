@@ -103,7 +103,8 @@ async def get_active_invidious_instances():
     """Fetch online invidious instances from api.invidious.io."""
     try:
         logger.info("Fetching active instances from api.invidious.io...")
-        async with httpx.AsyncClient(timeout=6.0) as client:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+        async with httpx.AsyncClient(timeout=6.0, headers=headers) as client:
             r = await client.get("https://api.invidious.io/instances.json")
             if r.status_code == 200:
                 instances = r.json()
@@ -139,7 +140,8 @@ async def fetch_video_info_via_invidious(video_id: str):
         url = f"https://{domain}/api/v1/videos/{video_id}"
         logger.info(f"Trying Invidious instance for info: {domain}")
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+            async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
                 res = await client.get(url)
                 if res.status_code == 200:
                     data = res.json()
@@ -325,7 +327,8 @@ async def get_streams_via_piped(video_id: str, format_type: str, quality: str):
         url = f"{api_base}/streams/{video_id}"
         logger.info(f"Trying Piped instance for streaming: {api_base}")
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+            async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
                 res = await client.get(url)
                 if res.status_code == 200:
                     data = res.json()
@@ -535,7 +538,8 @@ async def fetch_metadata_via_piped(video_id: str):
         url = f"{api_base}/streams/{video_id}"
         logger.info(f"Trying Piped instance to fetch metadata: {api_base}")
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+            async with httpx.AsyncClient(timeout=5.0, headers=headers) as client:
                 res = await client.get(url)
                 if res.status_code == 200:
                     data = res.json()
@@ -560,7 +564,8 @@ async def fetch_metadata_via_oembed(url: str, video_id: str):
     oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
     logger.info(f"Fetching metadata via YouTube OEmbed: {oembed_url}")
     try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+        async with httpx.AsyncClient(timeout=4.0, headers=headers) as client:
             res = await client.get(oembed_url)
             if res.status_code == 200:
                 data = res.json()
@@ -1114,7 +1119,8 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                         
                     progress_store[req.download_id] = {"status": "streaming", "progress": 10}
                     
-                    client = httpx.AsyncClient(timeout=60.0)
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+                    client = httpx.AsyncClient(timeout=60.0, headers=headers)
                     response = await client.send(client.build_request("GET", stream_url1), stream=True)
                     
                     if response.status_code >= 400:
