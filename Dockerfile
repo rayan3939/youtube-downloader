@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code (including cookies.txt)
 COPY . .
 
-# Expose port (Koyeb uses PORT env var)
-EXPOSE 8000
+# Expose port (HuggingFace Spaces uses 7860 by default)
+EXPOSE 7860
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"]
