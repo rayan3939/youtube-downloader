@@ -13,6 +13,9 @@ import tempfile
 import logging
 import asyncio
 import time
+import httpx
+import random
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -95,8 +98,166 @@ def get_base_ydl_opts():
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
+async def get_active_cobalt_instances():
+    """Fetch online cobalt instances from instances.cobalt.best."""
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get("https://instances.cobalt.best/api/instances.json")
+            if r.status_code == 200:
+                instances = r.json()
+                online_apis = []
+                for inst in instances:
+                    online_val = inst.get("online")
+                    is_online = False
+                    if isinstance(online_val, bool):
+                        is_online = online_val
+                    elif isinstance(online_val, dict):
+                        is_online = online_val.get("api") == True or online_val.get("status") == "up"
+                    elif isinstance(online_val, int):
+                        is_online = online_val == 1
+                    else:
+                        is_online = online_val is not False
+                    
+                    if is_online:
+                        api = inst.get("api")
+                        if api:
+                            if api.endswith("/"):
+                                api = api[:-1]
+                            score = inst.get("score", 0)
+                            online_apis.append({"api": api, "score": score})
+                
+                # Sort by score descending
+                online_apis.sort(key=lambda x: x["score"], reverse=True)
+                return [x["api"] for x in online_apis]
+    except Exception as e:
+        logger.error(f"Error fetching active Cobalt instances: {str(e)}")
+    
+    # Fallback list if fetching fails
+    return [
+        "https://co.wuk.sh",
+        "https://cobalt.api.rylor.com",
+        "https://api.cobalt.tools"
+    ]
+
+async def download_via_cobalt(url: str, format_type: str, quality: str):
+    """Attempt to get a download stream URL from active Cobalt instances."""
+    instances = await get_active_cobalt_instances()
+    logger.info(f"Retrieved {len(instances)} active Cobalt instances to try.")
+    
+    payload = {
+        "url": url,
+        "videoQuality": quality if format_type == "mp4" else "1080",
+        "audioFormat": "mp3",
+        "downloadMode": "audio" if format_type == "mp3" else "auto",
+        "audioOnly": True if format_type == "mp3" else False,
+        "isAudioOnly": True if format_type == "mp3" else False,
+        "filenamePattern": "basic"
+    }
+    
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+    
+    for idx, api_base in enumerate(instances[:10]):
+        logger.info(f"Trying Cobalt instance {idx+1}/{min(len(instances), 10)}: {api_base}")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(api_base, headers=headers, json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    status = data.get("status")
+                    if status in ["redirect", "tunnel", "success"]:
+                        stream_url = data.get("url")
+                        if stream_url:
+                            logger.info(f"✅ Success using Cobalt instance {api_base}: {stream_url[:80]}...")
+                            filename = data.get("filename", "video")
+                            return stream_url, filename
+                    elif status == "picker":
+                        picker_items = data.get("picker", [])
+                        if picker_items and isinstance(picker_items, list):
+                            first_item_url = picker_items[0].get("url")
+                            if first_item_url:
+                                logger.info(f"✅ Success (picker) using Cobalt instance {api_base}")
+                                return first_item_url, "media"
+                    logger.warning(f"Cobalt instance {api_base} returned status '{status}'. Response: {res.text[:200]}")
+                else:
+                    logger.warning(f"Cobalt instance {api_base} returned status code {res.status_code}. Response: {res.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Cobalt instance {api_base} failed: {str(e)}")
+            
+    return None, None
+
+def get_video_id(url: str):
+    """Extract YouTube video ID from URL."""
+    pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/|youtube-nocookie\.com\/embed\/)([a-zA-Z0-9_-]{11})'
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1)
+    return None
+
+async def fetch_metadata_via_piped(video_id: str):
+    """Fetch video metadata using a public Piped instance."""
+    piped_instances = [
+        "https://api.piped.private.coffee",
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.leptons.xyz",
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.owo.si",
+        "https://pipedapi.ducks.party"
+    ]
+    random.shuffle(piped_instances)
+    
+    for api_base in piped_instances[:4]:
+        url = f"{api_base}/streams/{video_id}"
+        logger.info(f"Trying Piped instance to fetch metadata: {api_base}")
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.get(url)
+                if res.status_code == 200:
+                    data = res.json()
+                    title = data.get("title", "YouTube Video")
+                    channel = data.get("uploader", "Unknown Channel")
+                    duration = data.get("duration", 0)
+                    thumbnail = data.get("thumbnailUrl") or f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+                    
+                    logger.info(f"✅ Success fetching metadata from Piped: {title}")
+                    return {
+                        "title": title,
+                        "thumbnail": thumbnail,
+                        "duration": duration,
+                        "channel": channel
+                    }
+        except Exception as e:
+            logger.warning(f"Piped instance {api_base} metadata fetch failed: {str(e)}")
+    return None
+
+async def fetch_metadata_via_oembed(url: str, video_id: str):
+    """Fetch basic video metadata using YouTube's official public OEmbed API."""
+    oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
+    logger.info(f"Fetching metadata via YouTube OEmbed: {oembed_url}")
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            res = await client.get(oembed_url)
+            if res.status_code == 200:
+                data = res.json()
+                title = data.get("title", "YouTube Video")
+                channel = data.get("author_name", "Unknown Channel")
+                thumbnail = data.get("thumbnail_url") or f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+                return {
+                    "title": title,
+                    "thumbnail": thumbnail,
+                    "duration": 0,
+                    "channel": channel
+                }
+    except Exception as e:
+        logger.error(f"YouTube OEmbed metadata fetch failed: {str(e)}")
+    return None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
+
 # Health & Progress endpoints
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -122,6 +283,46 @@ async def test_ip():
         return {"status": "success", "length": len(res.read())}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/test_client")
+async def test_client(client_name: str, use_cookies: bool = False):
+    class CustomLogger:
+        def __init__(self):
+            self.lines = []
+        def debug(self, msg):
+            self.lines.append(f"[DEBUG] {msg}")
+        def info(self, msg):
+            self.lines.append(f"[INFO] {msg}")
+        def warning(self, msg):
+            self.lines.append(f"[WARNING] {msg}")
+        def error(self, msg):
+            self.lines.append(f"[ERROR] {msg}")
+
+    clog = CustomLogger()
+    try:
+        ydl_opts = {
+            "verbose": True,
+            "skip_download": True,
+            "logger": clog,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": [client_name],
+                }
+            }
+        }
+        if use_cookies and HAS_COOKIES:
+            ydl_opts["cookiefile"] = COOKIES_FILE
+            
+        def run_info():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info("https://www.youtube.com/watch?v=FvDWCXN_dDs", download=False)
+        
+        info = await asyncio.to_thread(run_info)
+        return {"status": "success", "client": client_name, "title": info.get("title"), "logs": clog.lines}
+    except Exception as e:
+        return {"status": "error", "client": client_name, "message": str(e), "logs": clog.lines}
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -252,8 +453,58 @@ async def get_video_info(req: VideoRequest, request: Request):
             "formats": formats,
         }
     except Exception as e:
-        logger.error(f"Error fetching info: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.warning(f"yt-dlp info fetch failed ({str(e)}), entering fallback flow...")
+        
+        # 1. Extract video ID
+        video_id = get_video_id(req.url)
+        if not video_id:
+            logger.error(f"Could not extract video ID from URL: {req.url}")
+            raise HTTPException(status_code=500, detail=f"Invalid YouTube URL: {str(e)}")
+            
+        # 2. Try Piped API
+        meta = await fetch_metadata_via_piped(video_id)
+        
+        # 3. Try OEmbed API if Piped failed
+        if not meta:
+            meta = await fetch_metadata_via_oembed(req.url, video_id)
+            
+        if not meta:
+            logger.error("All metadata fallback systems failed.")
+            raise HTTPException(status_code=500, detail=f"YouTube blocked metadata extraction and all fallback providers failed: {str(e)}")
+            
+        # Construct standard fallback format list
+        duration = meta.get("duration", 0)
+        fallback_formats = [
+            {"quality": "1080", "label": "1080p (Full HD)", "ext": "mp4", "size": 0},
+            {"quality": "720", "label": "720p (HD)", "ext": "mp4", "size": 0},
+            {"quality": "480", "label": "480p", "ext": "mp4", "size": 0},
+            {"quality": "360", "label": "360p", "ext": "mp4", "size": 0},
+            {"quality": "240", "label": "240p", "ext": "mp4", "size": 0},
+            {"quality": "144", "label": "144p", "ext": "mp4", "size": 0}
+        ]
+        
+        if duration > 0:
+            bitrate_map = {
+                1080: 3000 * 1024 / 8,
+                720: 1500 * 1024 / 8,
+                480: 800 * 1024 / 8,
+                360: 400 * 1024 / 8,
+                240: 250 * 1024 / 8,
+                144: 100 * 1024 / 8,
+            }
+            for fmt in fallback_formats:
+                q = int(fmt["quality"])
+                bitrate = bitrate_map.get(q, 1000 * 1024 / 8)
+                fmt["size"] = int(bitrate * duration)
+                
+        return {
+            "title": meta["title"],
+            "thumbnail": meta["thumbnail"],
+            "duration": duration,
+            "channel": meta["channel"],
+            "formats": fallback_formats,
+        }
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -445,14 +696,72 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         )
 
     except Exception as e:
-        logger.error(f"Download error: {str(e)}")
-        if req.download_id in progress_store:
-            try:
-                del progress_store[req.download_id]
-            except Exception:
-                pass
-        cleanup_temp_files_by_id(tmp_dir, tmp_id)
-        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
+        logger.warning(f"yt-dlp download failed ({str(e)}), entering Cobalt fallback rotation...")
+        progress_store[req.download_id] = {"status": "processing", "progress": 8}
+        
+        try:
+            stream_url, cobalt_filename = await download_via_cobalt(req.url, req.format, req.quality)
+            if not stream_url:
+                raise Exception("All Cobalt instance download attempts failed.")
+                
+            media_type = "audio/mpeg" if req.format == "mp3" else "video/mp4"
+            filename_ext = req.format
+            safe_title = "".join(c for c in (cobalt_filename or "video") if c.isalnum() or c in " -_").strip()
+            if not safe_title:
+                safe_title = "video"
+                
+            progress_store[req.download_id] = {"status": "streaming", "progress": 10}
+            
+            client = httpx.AsyncClient(timeout=60.0)
+            response = await client.send(client.build_request("GET", stream_url), stream=True)
+            
+            if response.status_code >= 400:
+                await response.aclose()
+                await client.aclose()
+                raise Exception(f"Cobalt stream URL returned status code {response.status_code}")
+                
+            file_size = response.headers.get("Content-Length")
+            headers = {
+                "Content-Disposition": f'attachment; filename="{safe_title}.{filename_ext}"',
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
+            }
+            if file_size:
+                headers["Content-Length"] = file_size
+                
+            async def iter_response():
+                try:
+                    total_bytes = int(file_size) if file_size else 0
+                    downloaded = 0
+                    async for chunk in response.aiter_bytes():
+                        downloaded += len(chunk)
+                        if total_bytes > 0:
+                            percent = 10 + int((downloaded / total_bytes) * 90)
+                            progress_store[req.download_id] = {"status": "streaming", "progress": percent}
+                        yield chunk
+                finally:
+                    await response.aclose()
+                    await client.aclose()
+                    if req.download_id in progress_store:
+                        try:
+                            del progress_store[req.download_id]
+                        except Exception:
+                            pass
+                            
+            return StreamingResponse(
+                iter_response(),
+                media_type=media_type,
+                headers=headers
+            )
+            
+        except Exception as fallback_err:
+            logger.error(f"Fallback download failed: {str(fallback_err)}")
+            if req.download_id in progress_store:
+                try:
+                    del progress_store[req.download_id]
+                except Exception:
+                    pass
+            cleanup_temp_files_by_id(tmp_dir, tmp_id)
+            raise HTTPException(status_code=500, detail=f"Download failed: {str(fallback_err)} (Original error: {str(e)})")
 
 
 # GET endpoint mirrors the POST for mobile browser compatibility
