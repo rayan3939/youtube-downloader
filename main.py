@@ -85,7 +85,6 @@ def get_base_ydl_opts():
         "quiet": True,
         "no_warnings": True,
         "nocheckcertificate": True,
-        "js_runtimes": ["deno"],
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios", "tv"],
