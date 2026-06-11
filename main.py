@@ -82,6 +82,12 @@ class DownloadRequest(BaseModel):
 
 progress_store = {}
 
+# Standard browser headers used across all outgoing requests
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 def get_base_ydl_opts():
     """Return base yt-dlp options with cookies if available."""
     opts = {
@@ -204,14 +210,16 @@ async def fetch_metadata_via_invidious(video_id: str):
                         
                         if height not in height_formats or total_size > height_formats[height]["size"]:
                             label = f"{height}p"
-                            if height == 1080:
+                            if height == 4320:
+                                label += " (8K Ultra HD)"
+                            elif height == 2160:
+                                label += " (4K Ultra HD)"
+                            elif height == 1440:
+                                label += " (2K)"
+                            elif height == 1080:
                                 label += " (Full HD)"
                             elif height == 720:
                                 label += " (HD)"
-                            elif height == 1440:
-                                label += " (2K)"
-                            elif height == 2160:
-                                label += " (4K Ultra HD)"
                                 
                             height_formats[height] = {
                                 "quality": str(height),
@@ -236,29 +244,70 @@ async def fetch_metadata_via_invidious(video_id: str):
     return None
 
 async def download_file_async(url, dest_path, download_id, start_pct, end_pct):
-    """Download a URL to dest_path asynchronously, updating progress in progress_store."""
-    logger.info(f"Downloading from googlevideo to {dest_path}...")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        async with client.stream("GET", url, headers=headers) as r:
-            if r.status_code >= 400:
-                raise Exception(f"Googlevideo returned status code {r.status_code}")
-            
-            total_bytes = int(r.headers.get("Content-Length", 0))
-            downloaded = 0
-            
-            with open(dest_path, "wb") as f:
-                async for chunk in r.iter_bytes(chunk_size=1048576):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_bytes > 0:
-                        pct = start_pct + (downloaded / total_bytes) * (end_pct - start_pct)
-                        progress_store[download_id] = {
-                            "status": "downloading",
-                            "progress": int(pct)
-                        }
+    """Download a URL to dest_path asynchronously with parallel chunked downloading for speed."""
+    logger.info(f"Downloading from stream to {dest_path}...")
+    
+    # First, get the total file size with a HEAD request
+    async with httpx.AsyncClient(timeout=30.0, headers=BROWSER_HEADERS) as client:
+        head_resp = await client.head(url, follow_redirects=True)
+        total_bytes = int(head_resp.headers.get("Content-Length", 0))
+        supports_range = head_resp.headers.get("Accept-Ranges", "").lower() == "bytes"
+    
+    NUM_PARALLEL = 4
+    CHUNK_READ_SIZE = 2 * 1024 * 1024  # 2MB read chunks
+    
+    if total_bytes > 5_000_000 and supports_range:
+        # Parallel chunked download for large files
+        logger.info(f"Using {NUM_PARALLEL}-connection parallel download for {total_bytes} bytes")
+        segment_size = total_bytes // NUM_PARALLEL
+        ranges = []
+        for i in range(NUM_PARALLEL):
+            start = i * segment_size
+            end = (i + 1) * segment_size - 1 if i < NUM_PARALLEL - 1 else total_bytes - 1
+            ranges.append((start, end))
+        
+        segment_data = [None] * NUM_PARALLEL
+        downloaded_total = [0]  # mutable for closure
+        
+        async def download_segment(idx, byte_start, byte_end):
+            range_header = {**BROWSER_HEADERS, "Range": f"bytes={byte_start}-{byte_end}"}
+            async with httpx.AsyncClient(timeout=120.0) as seg_client:
+                async with seg_client.stream("GET", url, headers=range_header) as r:
+                    parts = []
+                    async for chunk in r.aiter_bytes(chunk_size=CHUNK_READ_SIZE):
+                        parts.append(chunk)
+                        downloaded_total[0] += len(chunk)
+                        if total_bytes > 0:
+                            pct = start_pct + (downloaded_total[0] / total_bytes) * (end_pct - start_pct)
+                            progress_store[download_id] = {"status": "downloading", "progress": int(pct)}
+                    segment_data[idx] = b"".join(parts)
+        
+        await asyncio.gather(*[
+            download_segment(i, s, e) for i, (s, e) in enumerate(ranges)
+        ])
+        
+        with open(dest_path, "wb") as f:
+            for seg in segment_data:
+                if seg:
+                    f.write(seg)
+    else:
+        # Standard single-connection download for small files or servers without range support
+        async with httpx.AsyncClient(timeout=120.0, headers=BROWSER_HEADERS) as client:
+            async with client.stream("GET", url, headers=BROWSER_HEADERS, follow_redirects=True) as r:
+                if r.status_code >= 400:
+                    raise Exception(f"Stream returned status code {r.status_code}")
+                
+                if total_bytes == 0:
+                    total_bytes = int(r.headers.get("Content-Length", 0))
+                downloaded = 0
+                
+                with open(dest_path, "wb") as f:
+                    async for chunk in r.aiter_bytes(chunk_size=CHUNK_READ_SIZE):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_bytes > 0:
+                            pct = start_pct + (downloaded / total_bytes) * (end_pct - start_pct)
+                            progress_store[download_id] = {"status": "downloading", "progress": int(pct)}
 
 def get_best_audio_stream_url(invidious_data):
     """Extract best audio stream URL from Invidious video data."""
@@ -312,7 +361,7 @@ def get_video_and_audio_stream_urls(invidious_data, quality):
     return best_match["url"], audio_url
 
 async def get_streams_via_piped(video_id: str, format_type: str, quality: str):
-    """Query Piped instances for video/audio stream URLs."""
+    """Query Piped instances for video/audio stream URLs, preferring adaptive streams for correct quality."""
     piped_instances = [
         "https://api.piped.private.coffee",
         "https://pipedapi.kavin.rocks",
@@ -327,8 +376,7 @@ async def get_streams_via_piped(video_id: str, format_type: str, quality: str):
         url = f"{api_base}/streams/{video_id}"
         logger.info(f"Trying Piped instance for streaming: {api_base}")
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
-            async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
+            async with httpx.AsyncClient(timeout=8.0, headers=BROWSER_HEADERS) as client:
                 res = await client.get(url)
                 if res.status_code == 200:
                     data = res.json()
@@ -345,36 +393,58 @@ async def get_streams_via_piped(video_id: str, format_type: str, quality: str):
                         
                         if not video_streams:
                             continue
-                            
+                        
                         target_q = int(quality)
-                        if target_q <= 720:
-                            for f in video_streams:
-                                if not f.get("videoOnly"):
-                                    q_label = f.get("quality", "")
-                                    height_match = re.search(r'(\d+)', q_label)
-                                    if height_match and int(height_match.group(1)) == target_q:
-                                        return f["url"], None
-                                        
+                        
+                        # ALWAYS prefer adaptive (videoOnly) streams for correct quality
+                        # Progressive streams are typically limited to 360p/720p
+                        adaptive_videos = [f for f in video_streams if f.get("videoOnly")]
+                        progressive_videos = [f for f in video_streams if not f.get("videoOnly")]
+                        
                         best_video = None
-                        min_diff = float("inf")
-                        for f in video_streams:
-                            q_label = f.get("quality", "")
-                            height_match = re.search(r'(\d+)', q_label)
-                            if height_match:
-                                height = int(height_match.group(1))
-                                diff = abs(height - target_q)
-                                if diff < min_diff:
-                                    min_diff = diff
-                                    best_video = f
-                                    
+                        use_adaptive = False
+                        
+                        # Try adaptive streams first (these have correct quality up to 8K)
+                        if adaptive_videos:
+                            # Prefer MP4/webm, find closest quality
+                            min_diff = float("inf")
+                            for f in adaptive_videos:
+                                q_label = f.get("quality", "")
+                                height_match = re.search(r'(\d+)', q_label)
+                                if height_match:
+                                    height = int(height_match.group(1))
+                                    diff = abs(height - target_q)
+                                    if diff < min_diff or (diff == min_diff and f.get("mimeType", "").startswith("video/mp4")):
+                                        min_diff = diff
+                                        best_video = f
+                                        use_adaptive = True
+                        
+                        # Fall back to progressive if no adaptive match
+                        if not best_video and progressive_videos:
+                            min_diff = float("inf")
+                            for f in progressive_videos:
+                                q_label = f.get("quality", "")
+                                height_match = re.search(r'(\d+)', q_label)
+                                if height_match:
+                                    height = int(height_match.group(1))
+                                    diff = abs(height - target_q)
+                                    if diff < min_diff:
+                                        min_diff = diff
+                                        best_video = f
+                        
                         if not best_video:
                             best_video = video_streams[0]
-                            
+                            use_adaptive = best_video.get("videoOnly", False)
+                        
+                        # If using adaptive stream, we need a separate audio stream
                         best_audio_url = None
-                        if audio_streams:
+                        if use_adaptive and audio_streams:
                             audio_streams.sort(key=lambda x: int(x.get("bitrate") or 0), reverse=True)
                             best_audio_url = audio_streams[0]["url"]
+                        elif not use_adaptive:
+                            best_audio_url = None  # progressive has audio built in
                             
+                        logger.info(f"Piped: selected {'adaptive' if use_adaptive else 'progressive'} stream, quality={best_video.get('quality')}")
                         return best_video["url"], best_audio_url
         except Exception as e:
             logger.warning(f"Piped instance {api_base} streaming check failed: {str(e)}")
@@ -763,7 +833,7 @@ async def get_video_info(req: VideoRequest, request: Request):
                         label += " (HD)"
 
                     height_formats[bucket_height] = {
-                        "quality": str(height),
+                        "quality": str(bucket_height),
                         "label": label,
                         "ext": "mp4",
                         "size": total_size
@@ -803,9 +873,12 @@ async def get_video_info(req: VideoRequest, request: Request):
             logger.error("All metadata fallback systems failed.")
             raise HTTPException(status_code=500, detail=f"YouTube blocked metadata extraction and all fallback providers failed: {str(e)}")
             
-        # Construct standard fallback format list
+        # Construct standard fallback format list (including 8K/4K/2K)
         duration = meta.get("duration", 0)
         fallback_formats = [
+            {"quality": "4320", "label": "4320p (8K Ultra HD)", "ext": "mp4", "size": 0},
+            {"quality": "2160", "label": "2160p (4K Ultra HD)", "ext": "mp4", "size": 0},
+            {"quality": "1440", "label": "1440p (2K)", "ext": "mp4", "size": 0},
             {"quality": "1080", "label": "1080p (Full HD)", "ext": "mp4", "size": 0},
             {"quality": "720", "label": "720p (HD)", "ext": "mp4", "size": 0},
             {"quality": "480", "label": "480p", "ext": "mp4", "size": 0},
@@ -816,6 +889,9 @@ async def get_video_info(req: VideoRequest, request: Request):
         
         if duration > 0:
             bitrate_map = {
+                4320: 80000 * 1024 / 8,
+                2160: 30000 * 1024 / 8,
+                1440: 12000 * 1024 / 8,
                 1080: 3000 * 1024 / 8,
                 720: 1500 * 1024 / 8,
                 480: 800 * 1024 / 8,
@@ -930,19 +1006,19 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         else:
             ydl_opts = {
                 **get_base_ydl_opts(),
-                "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best",
+                "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best[height<={req.quality}]/best",
                 "outtmpl": tmp_path + ".%(ext)s",
                 "merge_output_format": "mp4",
-                "recode_video": "mp4",
-                "concurrent_fragment_downloads": 5,
+                "concurrent_fragment_downloads": 8,
                 "socket_timeout": 30,
-                "retries": 3,
+                "retries": 5,
+                "fragment_retries": 5,
+                "buffersize": 1024 * 64,
+                "http_chunk_size": 10 * 1024 * 1024,
                 "postprocessor_args": {
-                    "VideoConvertor+ffmpeg": [
+                    "Merger+ffmpeg": [
                         "-threads", "4",
-                        "-c:v", "libx264",
-                        "-crf", "20",
-                        "-preset", "ultrafast",
+                        "-c:v", "copy",
                         "-c:a", "aac",
                         "-b:a", "192k"
                     ]
@@ -993,7 +1069,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         def iterfile():
             try:
                 with open(out_file, "rb") as f:
-                    while chunk := f.read(1048576):  # 1MB chunks
+                    while chunk := f.read(4 * 1024 * 1024):  # 4MB chunks for faster streaming
                         yield chunk
             except Exception as e:
                 logger.error(f"Error during file streaming: {str(e)}")
@@ -1205,7 +1281,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
             def iterfile():
                 try:
                     with open(out_file, "rb") as f:
-                        while chunk := f.read(1048576):
+                        while chunk := f.read(4 * 1024 * 1024):  # 4MB chunks
                             yield chunk
                 finally:
                     if os.path.exists(out_file):
