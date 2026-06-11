@@ -113,6 +113,16 @@ async def health_check():
         "cookies": HAS_COOKIES,
     }
 
+import urllib.request
+@app.get("/api/test_ip")
+async def test_ip():
+    try:
+        req = urllib.request.Request("https://www.youtube.com/", headers={'User-Agent': 'Mozilla/5.0'})
+        res = urllib.request.urlopen(req, timeout=5)
+        return {"status": "success", "length": len(res.read())}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # /api/info — Fetch video metadata
