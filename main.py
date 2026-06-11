@@ -12,165 +12,37 @@ import re
 import tempfile
 import logging
 import asyncio
+import time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-import base64
-import httpx
-import random
-import time
+# Cookie file path — baked into the Docker image for cloud deployment
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+HAS_COOKIES = os.path.exists(COOKIES_FILE)
 
-IS_ON_CLOUD = os.environ.get("SPACE_ID") is not None or os.environ.get("RENDER") is not None
-
-def b64_decode_str(s):
-    return base64.b64decode(s).decode("utf-8")
-
-class RouteManager:
-    def __init__(self):
-        self.nodes = []
-        self.last_update = 0
-        self.lock = asyncio.Lock()
-
-    async def update_nodes(self):
-        async with self.lock:
-            # Refresh every 10 minutes
-            if time.time() - self.last_update < 600 and self.nodes:
-                return
-            
-            logger.info("Updating router node pool...")
-            new_nodes = set()
-            
-            # 1. Try Geonode API first (very fast, recently checked active proxies)
-            try:
-                geonode_url = b64_decode_str("aHR0cHM6Ly9wcm94eWxpc3QuZ2Vvbm9kZS5jb20vYXBpL3Byb3h5LWxpc3Q/bGltaXQ9MTAwJnBhZ2U9MSZzb3J0X2J5PWxhc3RDaGVja2VkJnNvcnRfdHlwZT1kZXNjJnByb3RvY29scz1odHRwJTJDaHR0cHM=")
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    res = await client.get(geonode_url)
-                    if res.status_code == 200:
-                        data = res.json().get("data", [])
-                        for item in data:
-                            ip = item.get("ip")
-                            port = item.get("port")
-                            protocols = item.get("protocols", [])
-                            protocol = "http"
-                            if "https" in protocols:
-                                protocol = "https"
-                            if ip and port:
-                                new_nodes.add(f"{protocol}://{ip}:{port}")
-            except Exception as e:
-                logger.warning(f"Geonode sync warning: {e}")
-                
-            # 2. Try other scraper fallbacks if Geonode returned very few proxies
-            if len(new_nodes) < 20:
-                # Obfuscated list of tuples (base64 encoded url, protocol)
-                encoded_urls = [
-                    ("aHR0cHM6Ly9hcGkucHJveHlzY3JhcGUuY29tL3YyLz9yZXF1ZXN0PWRpc3BsYXlwcm94aWVzJnByb3RvY29sPWh0dHAmdGltZW91dD0xMDAwMCZjb3VudHJ5PWFsbCZzc2w9YWxsJmFub255bWl0eT1hbGw=", "http"),
-                    ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1RoZVNwZWVkWC9QUk9YWS1MaXN0L21hc3Rlci9odHRwLnR4dA==", "http"),
-                    ("aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2NsYXJrZXRtL3Byb3h5LWxpc3QvbWFzdGVyL3Byb3h5LWxpc3QtcmF3LnR4dA==", "http")
-                ]
-                
-                async with httpx.AsyncClient(timeout=4.0) as client:
-                    async def fetch_url(encoded_url, protocol):
-                        try:
-                            url = b64_decode_str(encoded_url)
-                            res = await client.get(url)
-                            if res.status_code == 200:
-                                for line in res.text.splitlines():
-                                    line = line.strip()
-                                    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$', line):
-                                        new_nodes.add(f"{protocol}://{line}")
-                        except Exception as e:
-                            logger.warning(f"Fallback sync warning for {protocol}: {e}")
-
-                    await asyncio.gather(*(fetch_url(url, proto) for url, proto in encoded_urls))
-            
-            if new_nodes:
-                self.nodes = list(new_nodes)
-                self.last_update = time.time()
-                logger.info(f"Synchronized {len(self.nodes)} active route nodes.")
-            else:
-                logger.warning("No route nodes available. Using default direct gateway.")
-
-    async def get_active_node(self):
-        await self.update_nodes()
-        if not self.nodes:
-            return None
-        
-        sample = random.sample(self.nodes, min(len(self.nodes), 50))
-        logger.info(f"Verifying {len(sample)} route nodes in batches...")
-        
-        limits = httpx.Limits(max_connections=35, max_keepalive_connections=10)
-        
-        batch_size = 25
-        working_node = None
-        
-        for i in range(0, len(sample), batch_size):
-            batch = sample[i:i+batch_size]
-            logger.info(f"Testing batch of {len(batch)} nodes concurrently...")
-            
-            async def test_node(node):
-                try:
-                    client_kwargs = {
-                        "timeout": 3.0,
-                        "limits": limits,
-                        "pr" + "oxy": node
-                    }
-                    async with httpx.AsyncClient(**client_kwargs) as client:
-                        target = b64_decode_str("aHR0cHM6Ly93d3cueW91dHViZS5jb20vaWZyYW1lX2FwaQ==")
-                        res = await client.get(target, follow_redirects=True)
-                        if res.status_code == 200:
-                            return node
-                except Exception:
-                    pass
-                return None
-
-            # Run batch concurrently
-            tasks = [asyncio.create_task(test_node(n)) for n in batch]
-            
-            # Process as they complete
-            for next_task in asyncio.as_completed(tasks):
-                try:
-                    res = await next_task
-                    if res:
-                        working_node = res
-                        # Cancel remaining tasks in this batch
-                        for t in tasks:
-                            t.cancel()
-                        break
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
-            
-            if working_node:
-                break
-        
-        if working_node:
-            logger.info("Found verified route node.")
-            return working_node
-            
-        logger.warning("No verified route nodes found in batch. Using default gateway.")
-        return None
-
-router_pool = RouteManager()
+if HAS_COOKIES:
+    logger.info(f"✅ Cookies file found at {COOKIES_FILE}")
+else:
+    logger.warning("⚠️ No cookies.txt found — YouTube may block requests from datacenter IPs")
 
 # Initialize rate limiter
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Agency Downloader API", version="1.0.0")
+app = FastAPI(title="Agency Downloader API", version="2.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to the frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# YouTube URL validation regex - simplified and flexible to prevent false negatives
+# YouTube URL validation regex
 YOUTUBE_REGEX = re.compile(
     r'(?:youtube\.com|youtu\.be|youtube-nocookie\.com)',
     re.IGNORECASE
@@ -207,6 +79,22 @@ class DownloadRequest(BaseModel):
 
 progress_store = {}
 
+def get_base_ydl_opts():
+    """Return base yt-dlp options with cookies if available."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+    }
+    if HAS_COOKIES:
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Health & Progress endpoints
+# ──────────────────────────────────────────────────────────────────────────────
+
 @app.get("/api/progress/{download_id}")
 async def get_progress(download_id: str):
     data = progress_store.get(download_id, {"status": "starting", "progress": 0})
@@ -214,68 +102,40 @@ async def get_progress(download_id: str):
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "message": "Agency API is running smoothly."}
+    return {
+        "status": "ok",
+        "message": "Agency API is running smoothly.",
+        "cookies": HAS_COOKIES,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /api/info — Fetch video metadata
+# ──────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/info")
-@limiter.limit("10/minute")
+@limiter.limit("15/minute")
 async def get_video_info(req: VideoRequest, request: Request):
     """Fetch video metadata and format choices without downloading."""
     try:
-        info = None
-        last_error = None
-        
-        # Try up to 3 different verified nodes
-        for attempt in range(3):
-            node = await router_pool.get_active_node()
-            if not node and IS_ON_CLOUD:
-                if attempt > 0:
-                    break
-                raise HTTPException(
-                    status_code=503,
-                    detail="All download nodes are currently busy or offline. Please retry in a few seconds."
-                )
-                
-            ydl_opts = {
-                "quiet": True,
-                "skip_download": True,
-                "no_warnings": True,
-                "extract_flat": False,
-                "nocheckcertificate": True,
-                "socket_timeout": 8,  # Fast timeout for metadata fetch
-                "retries": 1,
-                "js_runtimes": ["node"],
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["tv"],
-                    }
-                }
-            }
-            if node:
-                ydl_opts["pr" + "oxy"] = node
-                
-            logger.info(f"Attempt {attempt + 1}: Fetching info using node {node}")
-            
-            def run_info():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(req.url, download=False)
-                    
-            try:
-                info = await asyncio.to_thread(run_info)
-                if info:
-                    break
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"Attempt {attempt + 1} failed with node {node}: {last_error}")
-                # Remove bad node
-                if node and node in router_pool.nodes:
-                    try:
-                        router_pool.nodes.remove(node)
-                        logger.info(f"Removed bad node {node} from pool. Remaining: {len(router_pool.nodes)}")
-                    except Exception:
-                        pass
-                        
+        ydl_opts = {
+            **get_base_ydl_opts(),
+            "skip_download": True,
+            "extract_flat": False,
+            "socket_timeout": 12,
+            "retries": 2,
+        }
+
+        logger.info(f"Fetching info for: {req.url} (cookies={HAS_COOKIES})")
+
+        def run_info():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(req.url, download=False)
+
+        info = await asyncio.to_thread(run_info)
+
         if not info:
-            raise Exception(f"No working connection nodes. Last error: {last_error}")
+            raise Exception("yt-dlp returned no data")
 
         # Get duration for size estimation
         duration = info.get("duration", 0)
@@ -295,9 +155,9 @@ async def get_video_info(req: VideoRequest, request: Request):
         if best_audio_size == 0 and duration > 0:
             best_audio_size = int((best_audio_tbr * 1000 / 8) * duration)
 
-        # Group formats by snapped standard height to prevent duplicates and clean up labels
+        # Group formats by snapped standard height to prevent duplicates
         height_formats = {}
-        
+
         standards = [
             (4320, "8K Ultra HD"),
             (2160, "4K Ultra HD"),
@@ -309,22 +169,22 @@ async def get_video_info(req: VideoRequest, request: Request):
             (240, ""),
             (144, "")
         ]
-        
+
         for f in info.get("formats", []):
             height = f.get("height")
             if height and f.get("vcodec") != "none":
                 # Find the standard snapped height (e.g. 1074 -> 1080)
                 best_std, tag = min(standards, key=lambda x: abs(x[0] - height))
-                
-                # Use standard if within 25% threshold, otherwise keep raw height as bucket
+
+                # Use standard if within 25% threshold
                 bucket_height = best_std if abs(best_std - height) <= 0.25 * best_std else height
-                
+
                 # Estimate video stream size
                 vsize = f.get("filesize") or f.get("filesize_approx") or 0
                 tbr = f.get("tbr")
                 if vsize == 0 and tbr and duration > 0:
                     vsize = int((tbr * 1000 / 8) * duration)
-                
+
                 total_size = vsize
                 if f.get("acodec") == "none":
                     total_size += best_audio_size
@@ -344,7 +204,7 @@ async def get_video_info(req: VideoRequest, request: Request):
                     bitrate = bitrate_map.get(bucket_height, 1000 * 1024 / 8)
                     total_size = int(bitrate * duration)
 
-                # Keep the format with the largest size/bitrate for this bucket
+                # Keep the format with the largest size for this bucket
                 existing = height_formats.get(bucket_height)
                 if not existing or total_size > existing["size"]:
                     label = f"{bucket_height}p"
@@ -358,18 +218,17 @@ async def get_video_info(req: VideoRequest, request: Request):
                         label += " (Full HD)"
                     elif bucket_height == 720:
                         label += " (HD)"
-                    
+
                     height_formats[bucket_height] = {
-                        "quality": str(height),  # Use raw height internally to select the correct stream
+                        "quality": str(height),
                         "label": label,
                         "ext": "mp4",
                         "size": total_size
                     }
 
         formats = list(height_formats.values())
-        # Sort formats highest resolution first
         formats.sort(key=lambda x: int(x["quality"]), reverse=True)
-        
+
         return {
             "title": info.get("title"),
             "thumbnail": info.get("thumbnail"),
@@ -379,24 +238,12 @@ async def get_video_info(req: VideoRequest, request: Request):
         }
     except Exception as e:
         logger.error(f"Error fetching info: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Failed to fetch video information: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/download")
-@limiter.limit("10/minute")
-async def download_video_get(
-    url: str,
-    format: str,
-    quality: str,
-    download_id: str,
-    request: Request,
-    background_tasks: BackgroundTasks
-):
-    """GET endpoint for downloading/streaming media (highly compatible with mobile browsers)."""
-    try:
-        req = DownloadRequest(url=url, format=format, quality=quality, download_id=download_id)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return await download_video(req, request, background_tasks)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /api/download — Download, process, and stream video/audio
+# ──────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/download")
 @limiter.limit("10/minute")
@@ -405,11 +252,11 @@ async def download_video(req: DownloadRequest, request: Request, background_task
     tmp_dir = tempfile.gettempdir()
     tmp_id = str(uuid.uuid4())
     tmp_path = os.path.join(tmp_dir, tmp_id)
-    
+
     out_file = None
     media_type = None
     filename_ext = None
-    
+
     # Define progress hook closure
     def make_progress_hook(download_id):
         if download_id not in progress_store:
@@ -417,50 +264,45 @@ async def download_video(req: DownloadRequest, request: Request, background_task
 
         def hook(d):
             state = progress_store.get(download_id, {"status": "starting", "progress": 0})
-            
+
             if d['status'] == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                 downloaded = d.get('downloaded_bytes', 0)
                 percent = downloaded / total if total > 0 else 0
-                
+
                 info_dict = d.get('info_dict', {}) or {}
                 vcodec = info_dict.get('vcodec') or 'none'
                 acodec = info_dict.get('acodec') or 'none'
-                
+
                 is_video = (vcodec != 'none')
                 is_audio = (acodec != 'none')
-                
+
                 if is_video and is_audio:
-                    # Combined stream (single download)
-                    progress = 5 + int(percent * 80) # 5% to 85%
+                    progress = 5 + int(percent * 80)
                 elif is_video and not is_audio:
-                    # Video-only stream
-                    progress = 5 + int(percent * 65) # 5% to 70%
+                    progress = 5 + int(percent * 65)
                 elif is_audio and not is_video:
                     if req.format == "mp4":
-                        # Audio stream of a video+audio download
-                        progress = 70 + int(percent * 15) # 70% to 85%
+                        progress = 70 + int(percent * 15)
                     else:
-                        # MP3 download
-                        progress = 5 + int(percent * 80) # 5% to 85%
+                        progress = 5 + int(percent * 80)
                 else:
                     progress = 5 + int(percent * 80)
-                
-                # Monotonically increasing progress check
+
                 current_p = state.get("progress", 0)
                 if progress > current_p:
                     state["progress"] = progress
                 state["status"] = "downloading"
-                
+
             elif d['status'] == 'finished':
                 current_p = state.get("progress", 0)
                 if req.format == "mp4" and current_p <= 70:
                     state["progress"] = 70
-                    state["status"] = "downloading" # Still downloading audio
+                    state["status"] = "downloading"
                 else:
                     state["progress"] = 90
-                    state["status"] = "processing" # Merging/converting
-                    
+                    state["status"] = "processing"
+
             progress_store[download_id] = state
         return hook
 
@@ -468,134 +310,77 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         # Initialize progress store entry
         progress_store[req.download_id] = {"status": "starting", "progress": 0}
 
-        info = None
-        last_error = None
-        out_file = None
-        media_type = None
-        filename_ext = None
-        
-        for attempt in range(2):
-            node = await router_pool.get_active_node()
-            if not node and IS_ON_CLOUD:
-                if attempt > 0:
-                    break
-                raise HTTPException(
-                    status_code=503,
-                    detail="All download nodes are currently busy or offline. Please retry in a few seconds."
-                )
-
-            if req.format == "mp3":
-                ydl_opts = {
-                    "format": "bestaudio/best",
-                    "outtmpl": tmp_path + ".%(ext)s",
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": req.quality,
-                    }],
-                    "quiet": True,
-                    "no_warnings": True,
-                    "concurrent_fragment_downloads": 5,
-                    "nocheckcertificate": True,
-                    "socket_timeout": 30,
-                    "retries": 3,
-                    "js_runtimes": ["node"],
-                    "postprocessor_args": {
-                        "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
-                    },
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": ["tv"],
-                        }
-                    }
-                }
-                out_file = tmp_path + ".mp3"
-                media_type = "audio/mpeg"
-                filename_ext = "mp3"
-            else:
-                # We prioritize downloading compatible MP4 (H264) and M4A (AAC) streams.
-                # If compatible streams are found, they are merged instantly (under 1 second) with no transcoding.
-                # If not found (e.g. for resolutions above 1080p), we fall back to best video and audio
-                # and transcode to high-quality compatible MP4.
-                ydl_opts = {
-                    "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best",
-                    "outtmpl": tmp_path + ".%(ext)s",
-                    "merge_output_format": "mp4",
-                    "recode_video": "mp4",
-                    "quiet": True,
-                    "no_warnings": True,
-                    "concurrent_fragment_downloads": 5,
-                    "nocheckcertificate": True,
-                    "socket_timeout": 30,
-                    "retries": 3,
-                    "js_runtimes": ["node"],
-                    "postprocessor_args": {
-                        "VideoConvertor+ffmpeg": [
-                            "-threads", "4",
-                            "-c:v", "libx264",
-                            "-crf", "20",      # visually lossless compression
-                            "-preset", "ultrafast",
-                            "-c:a", "aac",
-                            "-b:a", "192k"     # high quality audio
-                        ]
-                    },
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": ["tv"],
-                        }
-                    }
-                }
-                out_file = tmp_path + ".mp4"
-                media_type = "video/mp4"
-                filename_ext = "mp4"
-            
-            if node:
-                ydl_opts["pr" + "oxy"] = node
-
-            # Attach the progress hook to options
-            ydl_opts["progress_hooks"] = [make_progress_hook(req.download_id)]
-            
-            logger.info(f"Download attempt {attempt + 1}: starting using node {node}")
-            
-            def run_download():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(req.url, download=True)
-                    
-            try:
-                info = await asyncio.to_thread(run_download)
-                if info:
-                    break
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"Download attempt {attempt + 1} failed with node {node}: {last_error}")
-                # Clean up any partial files from this failed download attempt
-                cleanup_temp_files_by_id(tmp_dir, tmp_id)
-                # Remove bad node
-                if node and node in router_pool.nodes:
-                    try:
-                        router_pool.nodes.remove(node)
-                    except Exception:
-                        pass
+        if req.format == "mp3":
+            ydl_opts = {
+                **get_base_ydl_opts(),
+                "format": "bestaudio/best",
+                "outtmpl": tmp_path + ".%(ext)s",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": req.quality,
+                }],
+                "concurrent_fragment_downloads": 5,
+                "socket_timeout": 30,
+                "retries": 3,
+                "postprocessor_args": {
+                    "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
+                },
+            }
+            out_file = tmp_path + ".mp3"
+            media_type = "audio/mpeg"
+            filename_ext = "mp3"
         else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Download failed after multiple attempts: {last_error or 'No working connection nodes'}"
-            )
+            ydl_opts = {
+                **get_base_ydl_opts(),
+                "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best",
+                "outtmpl": tmp_path + ".%(ext)s",
+                "merge_output_format": "mp4",
+                "recode_video": "mp4",
+                "concurrent_fragment_downloads": 5,
+                "socket_timeout": 30,
+                "retries": 3,
+                "postprocessor_args": {
+                    "VideoConvertor+ffmpeg": [
+                        "-threads", "4",
+                        "-c:v", "libx264",
+                        "-crf", "20",
+                        "-preset", "ultrafast",
+                        "-c:a", "aac",
+                        "-b:a", "192k"
+                    ]
+                },
+            }
+            out_file = tmp_path + ".mp4"
+            media_type = "video/mp4"
+            filename_ext = "mp4"
+
+        # Attach progress hook
+        ydl_opts["progress_hooks"] = [make_progress_hook(req.download_id)]
+
+        logger.info(f"Starting download: {req.url} format={req.format} quality={req.quality}")
+
+        def run_download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(req.url, download=True)
+
+        info = await asyncio.to_thread(run_download)
+
+        if not info:
+            raise Exception("Download returned no data")
 
         title = info.get("title", "video")
-            
+
         # Update progress to streaming status
         progress_store[req.download_id] = {"status": "streaming", "progress": 100}
-            
+
         # Clean title for content disposition header
         safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()
         if not safe_title:
             safe_title = "video"
-            
+
         # Verify the file exists
         if not os.path.exists(out_file):
-            # Fallback if yt-dlp downloaded with a different extension (e.g. if merge failed)
-            # Find any file starting with our tmp_id
             files = [f for f in os.listdir(tmp_dir) if f.startswith(tmp_id)]
             if files:
                 out_file = os.path.join(tmp_dir, files[0])
@@ -607,31 +392,28 @@ async def download_video(req: DownloadRequest, request: Request, background_task
             else:
                 raise FileNotFoundError("Downloaded file could not be found.")
 
-        # Read file and stream to client, ensuring we clean up afterwards
+        # Stream file to client with cleanup
         def iterfile():
             try:
                 with open(out_file, "rb") as f:
-                    while chunk := f.read(1048576): # 1MB chunks
+                    while chunk := f.read(1048576):  # 1MB chunks
                         yield chunk
             except Exception as e:
                 logger.error(f"Error during file streaming: {str(e)}")
             finally:
-                # Always remove the file when streaming ends or gets cancelled
                 if os.path.exists(out_file):
                     try:
                         os.remove(out_file)
-                        logger.info(f"Successfully cleaned up temp file: {out_file}")
+                        logger.info(f"Cleaned up temp file: {out_file}")
                     except Exception as ex:
                         logger.error(f"Failed to remove temp file {out_file}: {str(ex)}")
-                
-                # Always clean up progress store entry when stream terminates
                 if req.download_id in progress_store:
                     try:
                         del progress_store[req.download_id]
                     except Exception:
                         pass
 
-        # As an extra safety net, queue cleanup in background tasks too
+        # Safety net cleanup
         background_tasks.add_task(cleanup_temp_file, out_file)
 
         file_size = os.path.getsize(out_file)
@@ -640,24 +422,46 @@ async def download_video(req: DownloadRequest, request: Request, background_task
             "Content-Length": str(file_size),
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
         }
-        
+
         return StreamingResponse(
             iterfile(),
             media_type=media_type,
             headers=headers
         )
-        
+
     except Exception as e:
         logger.error(f"Download error: {str(e)}")
-        # Clean up progress store entry on failure
         if req.download_id in progress_store:
             try:
                 del progress_store[req.download_id]
             except Exception:
                 pass
-        # If download failed, clean up any partial files
         cleanup_temp_files_by_id(tmp_dir, tmp_id)
         raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
+
+
+# GET endpoint mirrors the POST for mobile browser compatibility
+@app.get("/api/download")
+@limiter.limit("10/minute")
+async def get_download_video(
+    url: str,
+    format: str,
+    quality: str,
+    download_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks
+):
+    """GET endpoint for downloading/streaming media (mobile browser compatible)."""
+    try:
+        req = DownloadRequest(url=url, format=format, quality=quality, download_id=download_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return await download_video(req, request, background_tasks)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers & Utility Routes
+# ──────────────────────────────────────────────────────────────────────────────
 
 def cleanup_temp_file(file_path: str):
     """Clean up helper for background task."""
@@ -669,7 +473,7 @@ def cleanup_temp_file(file_path: str):
             logger.error(f"Background cleanup failed for {file_path}: {str(e)}")
 
 def cleanup_temp_files_by_id(directory: str, file_id: str):
-    """Finds and removes any temporary files matching the uuid prefix in case of errors."""
+    """Finds and removes any temporary files matching the uuid prefix."""
     try:
         for f in os.listdir(directory):
             if f.startswith(file_id):
@@ -691,96 +495,3 @@ class DmcaRequest(BaseModel):
 async def submit_dmca(req: DmcaRequest, request: Request):
     logger.info(f"DMCA Request received from {req.name} ({req.email}) for URL: {req.url}. Description: {req.description}")
     return {"status": "success", "message": "DMCA request submitted successfully. We will review it within 48 hours."}
-
-@app.get("/api/test")
-async def test_ytdl(url: str):
-    results = {}
-    
-    # Test 1: Default ytdl_opts with timeout
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "no_warnings": True,
-            "nocheckcertificate": True,
-            "socket_timeout": 8,
-            "retries": 1,
-        }
-        def t1():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        info = await asyncio.to_thread(t1)
-        results["default"] = {"success": True, "formats": len(info.get("formats", []))}
-    except Exception as e:
-        results["default"] = {"success": False, "error": str(e)}
-
-    # Test 2: With TV client only and timeout
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "no_warnings": True,
-            "nocheckcertificate": True,
-            "socket_timeout": 8,
-            "retries": 1,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["tv"],
-                }
-            }
-        }
-        def t2():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        info = await asyncio.to_thread(t2)
-        results["tv_client"] = {"success": True, "formats": len(info.get("formats", []))}
-    except Exception as e:
-        results["tv_client"] = {"success": False, "error": str(e)}
-
-    # Test 3: With Android/iOS client and timeout
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "no_warnings": True,
-            "nocheckcertificate": True,
-            "socket_timeout": 8,
-            "retries": 1,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "ios"],
-                }
-            }
-        }
-        def t3():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        info = await asyncio.to_thread(t3)
-        results["android_ios"] = {"success": True, "formats": len(info.get("formats", []))}
-    except Exception as e:
-        results["android_ios"] = {"success": False, "error": str(e)}
-
-    # Test 4: With all clients (android, ios, tv, mweb, web) and timeout
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "no_warnings": True,
-            "nocheckcertificate": True,
-            "socket_timeout": 8,
-            "retries": 1,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "ios", "tv", "mweb", "web"],
-                }
-            }
-        }
-        def t4():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        info = await asyncio.to_thread(t4)
-        results["all_clients"] = {"success": True, "formats": len(info.get("formats", []))}
-    except Exception as e:
-        results["all_clients"] = {"success": False, "error": str(e)}
-
-    return results

@@ -1,10 +1,6 @@
 fastapi
 uvicorn
 https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
-yt-dlp-ejs
 ffmpeg-python
 python-multipart
 slowapi
-httpx[socks]
-
-
