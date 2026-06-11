@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
+yt-dlp[full]>=2024.07.00
 ffmpeg-python
 python-multipart
 slowapi
 httpx
+# Note: aria2c must be installed on the system for faster downloads

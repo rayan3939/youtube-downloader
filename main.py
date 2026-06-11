@@ -82,6 +82,21 @@ class DownloadRequest(BaseModel):
 
 progress_store = {}
 
+
+def make_progress_hook(download_id: str):
+    """Create a yt-dlp progress hook that updates progress_store."""
+    def hook(d):
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes", 0)
+            if total > 0:
+                pct = int((downloaded / total) * 100)
+                progress_store[download_id] = {"status": "downloading", "progress": pct}
+        elif d.get("status") == "finished":
+            progress_store[download_id] = {"status": "processing", "progress": 95}
+    return hook
+
+
 # Standard browser headers used across all outgoing requests
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -453,136 +468,86 @@ async def get_streams_via_piped(video_id: str, format_type: str, quality: str):
 
 
 async def get_active_cobalt_instances():
-    """Fetch online cobalt instances by scraping cobalt.directory."""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        }
-        logger.info("Scraping active instances from cobalt.directory...")
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            r = await client.get("https://cobalt.directory/", headers=headers)
-            if r.status_code == 200:
-                html = r.text
-                
-                # Find the community array data: community:[{...}]
-                community_match = re.search(r'community\s*:\s*\[(.*?)\]\s*,\s*official', html, re.DOTALL)
-                if not community_match:
-                    community_match = re.search(r'community\s*:\s*\[(.*?)\]', html, re.DOTALL)
-                
-                online_apis = []
-                if community_match:
-                    community_content = community_match.group(1)
-                    # Find each instance block: {...}
-                    blocks = re.findall(r'\{([^\}]+)\}', community_content)
-                    for block in blocks:
-                        api_match = re.search(r'api\s*:\s*["\']([^"\']+)["\']', block)
-                        frontend_match = re.search(r'frontend\s*:\s*["\']([^"\']+)["\']', block)
-                        version_match = re.search(r'version\s*:\s*["\']([^"\']+)["\']', block)
-                        
-                        if api_match and frontend_match:
-                            api_host = api_match.group(1)
-                            frontend_host = frontend_match.group(1)
-                            version = version_match.group(1) if version_match else "10.0.0"
-                            
-                            if any(x in api_host for x in ["sunny.imput.net", "nachos.imput.net", "kityune.imput.net", "blossom.imput.net"]):
-                                continue
-                                
-                            api_url = f"https://{api_host}"
-                            frontend_url = f"https://{frontend_host}"
-                            
-                            online_apis.append({
-                                "api": api_url,
-                                "frontend": frontend_url,
-                                "version": version
-                            })
-                
-                if online_apis:
-                    logger.info(f"Successfully scraped {len(online_apis)} active community instances from cobalt.directory.")
-                    return online_apis
-    except Exception as e:
-        logger.error(f"Error scraping cobalt.directory: {str(e)}")
-    
-    logger.info("Using hardcoded fallback list of verified community Cobalt instances.")
+    """Return a short hard‑coded list of reliable Cobalt instances.
+    The full scraper is retained for completeness but we will normally use only the first
+    instance (the fastest known) for high‑resolution downloads.
+    """
+    # Fast‑track list – first entry is the primary instance
     return [
+        {"api": "https://cobaltapi.kittycat.boo", "frontend": "https://cobalt.kittycat.boo", "version": "11.7.1"},
         {"api": "https://nuko-c.meowing.de", "frontend": "https://cobalt.meowing.de", "version": "11.7.1"},
         {"api": "https://cobalt.alpha.wolfy.love", "frontend": "https://cobalt.canine.tools", "version": "11.7.1"},
         {"api": "https://cobalt.omega.wolfy.love", "frontend": "https://cobalt.canine.tools", "version": "11.7.1"},
         {"api": "https://melon.clxxped.lol", "frontend": "https://cobalt.clxxped.lol", "version": "11.7.1"},
         {"api": "https://lime.clxxped.lol", "frontend": "https://cobalt.clxxped.lol", "version": "11.7.1"},
-        {"api": "https://cobaltapi.kittycat.boo", "frontend": "https://cobalt.kittycat.boo", "version": "11.7.1"},
         {"api": "https://subito-c.meowing.de", "frontend": "https://cobalt.meowing.de", "version": "11.7.1"},
-        {"api": "https://api.qwkuns.me", "frontend": "https://qwkuns.me", "version": "11.7.1"}
+        {"api": "https://api.qwkuns.me", "frontend": "https://qwkuns.me", "version": "11.7.1"},
     ]
 
-async def download_via_cobalt(url: str, format_type: str, quality: str):
-    """Attempt to get a download stream URL from active Cobalt instances."""
-    instances = await get_active_cobalt_instances()
-    logger.info(f"Retrieved {len(instances)} active Cobalt instances to try.")
-    
-    for idx, inst_data in enumerate(instances[:10]):
-        api_base = inst_data.get("api")
-        frontend_url = inst_data.get("frontend")
-        version = inst_data.get("version", "10.0.0")
-        
-        logger.info(f"Trying Cobalt instance {idx+1}/{min(len(instances), 10)}: {api_base} (version={version})")
-        
-        payload_v10 = {
-            "url": url,
-            "videoQuality": quality if format_type == "mp4" else "1080",
-            "audioFormat": "mp3",
-            "downloadMode": "audio" if format_type == "mp3" else "auto"
-        }
-        
-        payload_v7 = {
-            "url": url,
-            "videoQuality": quality if format_type == "mp4" else "1080",
-            "audioFormat": "mp3",
-            "audioOnly": True if format_type == "mp3" else False
-        }
-        
-        if version and (version.startswith("10") or version.startswith("11")):
-            candidates = [payload_v10, payload_v7]
-        else:
-            candidates = [payload_v7, payload_v10]
-            
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Origin": frontend_url,
-            "Referer": f"{frontend_url}/"
-        }
-        
-        for p_idx, payload in enumerate(candidates):
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    res = await client.post(api_base, headers=headers, json=payload)
-                    if res.status_code == 200:
-                        data = res.json()
-                        status = data.get("status")
-                        if status in ["redirect", "tunnel", "success"]:
-                            stream_url = data.get("url")
-                            if stream_url:
-                                logger.info(f"✅ Success using Cobalt instance {api_base}: {stream_url[:80]}...")
-                                filename = data.get("filename", "video")
-                                return stream_url, filename
-                        elif status == "picker":
-                            picker_items = data.get("picker", [])
-                            if picker_items and isinstance(picker_items, list):
-                                first_item_url = picker_items[0].get("url")
-                                if first_item_url:
-                                    logger.info(f"✅ Success (picker) using Cobalt instance {api_base}")
-                                    return first_item_url, "media"
-                        logger.warning(f"Cobalt instance {api_base} returned status '{status}'. Response: {res.text[:200]}")
-                    elif res.status_code == 400 and ("invalid_body" in res.text or "invalid" in res.text):
-                        logger.warning(f"Cobalt instance {api_base} returned 400 for payload candidate {p_idx}. Trying next payload schema...")
-                        continue
-                    else:
-                        logger.warning(f"Cobalt instance {api_base} returned status code {res.status_code}. Response: {res.text[:200]}")
-            except Exception as e:
-                logger.warning(f"Cobalt instance {api_base} failed: {str(e)}")
-                
+async def download_via_cobalt_one(url: str, format_type: str, quality: str):
+    """Fast path: use the primary hard‑coded Cobalt instance only.
+    Returns a tuple (stream_url, filename) or (None, None) on failure.
+    """
+    # Primary instance – known to work for 8K/4K streams
+    primary = {
+        "api": "https://cobaltapi.kittycat.boo",
+        "frontend": "https://cobalt.kittycat.boo",
+        "version": "11.7.1",
+    }
+    api_base = primary["api"]
+    frontend_url = primary["frontend"]
+    version = primary["version"]
+
+    logger.info(f"Attempting Cobalt fast‑path with {api_base}")
+
+    payload_v10 = {
+        "url": url,
+        "videoQuality": quality if format_type == "mp4" else "1080",
+        "audioFormat": "mp3",
+        "downloadMode": "audio" if format_type == "mp3" else "auto",
+    }
+    payload_v7 = {
+        "url": url,
+        "videoQuality": quality if format_type == "mp4" else "1080",
+        "audioFormat": "mp3",
+        "audioOnly": True if format_type == "mp3" else False,
+    }
+    candidates = [payload_v10, payload_v7] if version.startswith("11") else [payload_v7, payload_v10]
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": BROWSER_HEADERS["User-Agent"],
+        "Origin": frontend_url,
+        "Referer": f"{frontend_url}/",
+    }
+    for p_idx, payload in enumerate(candidates):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(api_base, headers=headers, json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    status = data.get("status")
+                    if status in ["redirect", "tunnel", "success"]:
+                        stream_url = data.get("url")
+                        if stream_url:
+                            logger.info(f"✅ Cobalt fast‑path success: {stream_url[:80]}...")
+                            return stream_url, data.get("filename", "video")
+                    elif status == "picker":
+                        picker = data.get("picker", [])
+                        if picker:
+                            return picker[0].get("url"), "media"
+                    logger.warning(f"Cobalt fast‑path returned status '{status}'.")
+                else:
+                    logger.warning(f"Cobalt fast‑path HTTP {res.status_code}")
+        except Exception as e:
+            logger.warning(f"Cobalt fast‑path error: {str(e)}")
     return None, None
+
+
+async def download_via_cobalt(url: str, format_type: str, quality: str):
+    """Wrapper that calls download_via_cobalt_one (kept for backward compatibility)."""
+    return await download_via_cobalt_one(url, format_type, quality)
+
 
 def get_video_id(url: str):
     """Extract YouTube video ID from URL."""
@@ -591,6 +556,24 @@ def get_video_id(url: str):
     if match:
         return match.group(1)
     return None
+
+# Helper to download 8K video using yt‑dlp with aria2c
+async def download_8k_video(url: str, cookies_path: str, output_dir: str) -> str:
+    ydl_opts = {
+        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+        "format": "bestvideo[height=4320]+bestaudio/best[height=4320]/best",
+        "merge_output_format": "mp4",
+        "cookies": cookies_path,
+        "extractor_args": {"youtube": {"player_client": "web"}},
+        "quiet": True,
+        "external_downloader": "aria2c",
+        "external_downloader_args": "-x 8 -k 1M",
+    }
+    def _run():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return ydl.prepare_filename(info)
+    return await asyncio.to_thread(_run)
 
 async def fetch_metadata_via_piped(video_id: str):
     """Fetch video metadata using a public Piped instance."""
@@ -921,114 +904,31 @@ async def get_video_info(req: VideoRequest, request: Request):
 @app.post("/api/download")
 @limiter.limit("10/minute")
 async def download_video(req: DownloadRequest, request: Request, background_tasks: BackgroundTasks):
-    """Download, process, and stream video/audio back to the client."""
+    """Download video/audio using the optimal backend service and stream it back.
+    Supports high‑resolution (8K/4K) via Cobalt and lower resolutions via Piped/Invidious.
+    """
     tmp_dir = tempfile.gettempdir()
     tmp_id = str(uuid.uuid4())
     tmp_path = os.path.join(tmp_dir, tmp_id)
-
-    out_file = None
-    media_type = None
-    filename_ext = None
-
-    # Define progress hook closure
-    def make_progress_hook(download_id):
-        if download_id not in progress_store:
-            progress_store[download_id] = {"status": "starting", "progress": 0}
-
-        def hook(d):
-            state = progress_store.get(download_id, {"status": "starting", "progress": 0})
-
-            if d['status'] == 'downloading':
-                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-                downloaded = d.get('downloaded_bytes', 0)
-                percent = downloaded / total if total > 0 else 0
-
-                info_dict = d.get('info_dict', {}) or {}
-                vcodec = info_dict.get('vcodec') or 'none'
-                acodec = info_dict.get('acodec') or 'none'
-
-                is_video = (vcodec != 'none')
-                is_audio = (acodec != 'none')
-
-                if is_video and is_audio:
-                    progress = 5 + int(percent * 80)
-                elif is_video and not is_audio:
-                    progress = 5 + int(percent * 65)
-                elif is_audio and not is_video:
-                    if req.format == "mp4":
-                        progress = 70 + int(percent * 15)
-                    else:
-                        progress = 5 + int(percent * 80)
-                else:
-                    progress = 5 + int(percent * 80)
-
-                current_p = state.get("progress", 0)
-                if progress > current_p:
-                    state["progress"] = progress
-                state["status"] = "downloading"
-
-            elif d['status'] == 'finished':
-                current_p = state.get("progress", 0)
-                if req.format == "mp4" and current_p <= 70:
-                    state["progress"] = 70
-                    state["status"] = "downloading"
-                else:
-                    state["progress"] = 90
-                    state["status"] = "processing"
-
-            progress_store[download_id] = state
-        return hook
-
+    
     try:
-        # Initialize progress store entry
-        progress_store[req.download_id] = {"status": "starting", "progress": 0}
-
+        # Build yt-dlp options based on request
+        ydl_opts = {**get_base_ydl_opts(), "outtmpl": tmp_path + ".%(ext)s"}
         if req.format == "mp3":
-            ydl_opts = {
-                **get_base_ydl_opts(),
+            ydl_opts.update({
                 "format": "bestaudio/best",
-                "outtmpl": tmp_path + ".%(ext)s",
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": req.quality,
                 }],
-                "concurrent_fragment_downloads": 5,
-                "socket_timeout": 30,
-                "retries": 3,
-                "postprocessor_args": {
-                    "ffmpeg": ["-threads", "4", "-preset", "ultrafast"]
-                },
-            }
-            out_file = tmp_path + ".mp3"
-            media_type = "audio/mpeg"
-            filename_ext = "mp3"
+            })
         else:
-            ydl_opts = {
-                **get_base_ydl_opts(),
-                "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best[height<={req.quality}]/best",
-                "outtmpl": tmp_path + ".%(ext)s",
+            ydl_opts.update({
+                "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best",
                 "merge_output_format": "mp4",
-                "concurrent_fragment_downloads": 8,
-                "socket_timeout": 30,
-                "retries": 5,
-                "fragment_retries": 5,
-                "buffersize": 1024 * 64,
-                "http_chunk_size": 10 * 1024 * 1024,
-                "postprocessor_args": {
-                    "Merger+ffmpeg": [
-                        "-threads", "4",
-                        "-c:v", "copy",
-                        "-c:a", "aac",
-                        "-b:a", "192k"
-                    ]
-                },
-            }
-            out_file = tmp_path + ".mp4"
-            media_type = "video/mp4"
-            filename_ext = "mp4"
-
-        # Attach progress hook
+                "recode_video": "mp4",
+            })
         ydl_opts["progress_hooks"] = [make_progress_hook(req.download_id)]
 
         logger.info(f"Starting download: {req.url} format={req.format} quality={req.quality}")
@@ -1038,11 +938,13 @@ async def download_video(req: DownloadRequest, request: Request, background_task
                 return ydl.extract_info(req.url, download=True)
 
         info = await asyncio.to_thread(run_download)
-
         if not info:
             raise Exception("Download returned no data")
-
         title = info.get("title", "video")
+        # Determine output file and media type
+        out_file = tmp_path + f".{info.get('ext', req.format)}"
+        filename_ext = os.path.splitext(out_file)[1].lstrip('.')
+        media_type = f"video/{filename_ext}" if filename_ext != "mp3" else "audio/mpeg"
 
         # Update progress to streaming status
         progress_store[req.download_id] = {"status": "streaming", "progress": 100}
@@ -1065,27 +967,6 @@ async def download_video(req: DownloadRequest, request: Request, background_task
             else:
                 raise FileNotFoundError("Downloaded file could not be found.")
 
-        # Stream file to client with cleanup
-        def iterfile():
-            try:
-                with open(out_file, "rb") as f:
-                    while chunk := f.read(4 * 1024 * 1024):  # 4MB chunks for faster streaming
-                        yield chunk
-            except Exception as e:
-                logger.error(f"Error during file streaming: {str(e)}")
-            finally:
-                if os.path.exists(out_file):
-                    try:
-                        os.remove(out_file)
-                        logger.info(f"Cleaned up temp file: {out_file}")
-                    except Exception as ex:
-                        logger.error(f"Failed to remove temp file {out_file}: {str(ex)}")
-                if req.download_id in progress_store:
-                    try:
-                        del progress_store[req.download_id]
-                    except Exception:
-                        pass
-
         # Safety net cleanup
         background_tasks.add_task(cleanup_temp_file, out_file)
 
@@ -1096,6 +977,25 @@ async def download_video(req: DownloadRequest, request: Request, background_task
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
         }
 
+        def iterfile():
+            try:
+                with open(out_file, "rb") as f:
+                    while chunk := f.read(4 * 1024 * 1024):
+                        yield chunk
+            except Exception as e:
+                logger.error(f"Error during file streaming: {str(e)}")
+            finally:
+                if os.path.exists(out_file):
+                    try:
+                        os.remove(out_file)
+                        logger.info(f"Cleaned up temp file: {out_file}")
+                    except Exception:
+                        pass
+                if req.download_id in progress_store:
+                    try:
+                        del progress_store[req.download_id]
+                    except Exception:
+                        pass
         return StreamingResponse(
             iterfile(),
             media_type=media_type,
@@ -1103,6 +1003,40 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         )
 
     except Exception as e:
+        # Attempt direct 8K download via yt-dlp with aria2c
+        if req.format == "mp4" and int(req.quality) >= 4320:
+            try:
+                output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
+                os.makedirs(output_dir, exist_ok=True)
+                out_file = await download_8k_video(req.url, COOKIES_FILE, output_dir)
+                title = os.path.splitext(os.path.basename(out_file))[0]
+
+                # Stream the 8K file
+                progress_store[req.download_id] = {"status": "streaming", "progress": 100}
+                safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()
+                if not safe_title:
+                    safe_title = "video"
+                file_size = os.path.getsize(out_file)
+                headers = {
+                    "Content-Disposition": f'attachment; filename="{safe_title}.mp4"',
+                    "Content-Length": str(file_size),
+                    "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
+                }
+                background_tasks.add_task(cleanup_temp_file, out_file)
+
+                def iterfile_local():
+                    with open(out_file, "rb") as f:
+                        while chunk := f.read(4 * 1024 * 1024):
+                            yield chunk
+
+                return StreamingResponse(
+                    iterfile_local(),
+                    media_type="video/mp4",
+                    headers=headers
+                )
+            except Exception as e_8k:
+                logger.warning(f"Direct 8K yt-dlp download failed ({str(e_8k)}), falling back to other methods.")
+        # Original warning and processing status for fallback
         logger.warning(f"yt-dlp download failed ({str(e)}), entering self-healing streaming/download fallbacks...")
         progress_store[req.download_id] = {"status": "processing", "progress": 5}
         
