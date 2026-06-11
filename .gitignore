@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 test_*.py
 run_backend.sh
+test_*.mp4

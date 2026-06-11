@@ -572,7 +572,7 @@ async def download_8k_video(url: str, cookies_path: str, output_dir: str, target
     ydl_opts = {
         "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
         "format": f"bestvideo[height<={target_height}]+bestaudio/best[height<={target_height}]/best",
-        "merge_output_format": "mp4",
+        "format_sort": ["res", "vcodec:h264", "vcodec:vp9", "acodec:m4a"],
         "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
@@ -1030,7 +1030,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         else:
             ydl_opts.update({
                 "format": f"bestvideo[height<={req.quality}]+bestaudio/best[height<={req.quality}]/best",
-                "merge_output_format": "mp4",
+                "format_sort": ["res", "vcodec:h264", "vcodec:vp9", "acodec:m4a"],
             })
         ydl_opts["progress_hooks"] = [make_progress_hook(req.download_id)]
 
