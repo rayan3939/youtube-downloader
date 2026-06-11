@@ -111,10 +111,15 @@ def get_base_ydl_opts():
         "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "tv"],
+                "player_client": ["all"],
             }
-        }
+        },
     }
+    # Enable aria2c for fast multi-connection downloads if available
+    import shutil
+    if shutil.which("aria2c"):
+        opts["external_downloader"] = "aria2c"
+        opts["external_downloader_args"] = {"default": ["-x", "16", "-k", "1M", "-j", "16", "--file-allocation=none"]}
     if HAS_COOKIES:
         opts["cookiefile"] = COOKIES_FILE
     return opts
@@ -557,22 +562,60 @@ def get_video_id(url: str):
         return match.group(1)
     return None
 
-# Helper to download 8K video using yt‑dlp with aria2c
-async def download_8k_video(url: str, cookies_path: str, output_dir: str) -> str:
+# Helper to download 8K/4K video using yt-dlp with aria2c for maximum speed
+async def download_8k_video(url: str, cookies_path: str, output_dir: str, target_height: int = 4320, download_id: str = None) -> str:
+    """Download high-res video using yt-dlp with aria2c multi-connection acceleration.
+    Tries progressively lower resolutions if the target isn't available.
+    """
+    import shutil
+    
     ydl_opts = {
         "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
-        "format": "bestvideo[height=4320]+bestaudio/best[height=4320]/best",
+        "format": f"bestvideo[height<={target_height}]+bestaudio/best[height<={target_height}]/best",
         "merge_output_format": "mp4",
-        "cookies": cookies_path,
-        "extractor_args": {"youtube": {"player_client": "web"}},
+        "nocheckcertificate": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["all"],
+            }
+        },
         "quiet": True,
-        "external_downloader": "aria2c",
-        "external_downloader_args": "-x 8 -k 1M",
+        "no_warnings": True,
     }
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts["cookiefile"] = cookies_path
+    # Use aria2c for blazing fast parallel downloads
+    if shutil.which("aria2c"):
+        ydl_opts["external_downloader"] = "aria2c"
+        ydl_opts["external_downloader_args"] = {"default": ["-x", "16", "-k", "1M", "-j", "16", "--file-allocation=none"]}
+    # Add progress hook if download_id provided
+    if download_id:
+        ydl_opts["progress_hooks"] = [make_progress_hook(download_id)]
+
     def _run():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            return ydl.prepare_filename(info)
+            if not info:
+                raise Exception("yt-dlp returned no info for 8K download")
+            filename = ydl.prepare_filename(info)
+            # yt-dlp may change extension after merge
+            if not os.path.exists(filename):
+                base = os.path.splitext(filename)[0]
+                for ext in [".mp4", ".mkv", ".webm"]:
+                    if os.path.exists(base + ext):
+                        filename = base + ext
+                        break
+            if not os.path.exists(filename):
+                # Search output_dir for any recently created file
+                files = sorted(
+                    [os.path.join(output_dir, f) for f in os.listdir(output_dir)],
+                    key=os.path.getmtime, reverse=True
+                )
+                if files:
+                    filename = files[0]
+                else:
+                    raise FileNotFoundError(f"Downloaded 8K file not found in {output_dir}")
+            return filename
     return await asyncio.to_thread(_run)
 
 async def fetch_metadata_via_piped(video_id: str):
@@ -905,12 +948,73 @@ async def get_video_info(req: VideoRequest, request: Request):
 @limiter.limit("10/minute")
 async def download_video(req: DownloadRequest, request: Request, background_tasks: BackgroundTasks):
     """Download video/audio using the optimal backend service and stream it back.
-    Supports high‑resolution (8K/4K) via Cobalt and lower resolutions via Piped/Invidious.
+    Supports high-resolution (8K/4K) via yt-dlp+aria2c and lower resolutions via Piped/Invidious.
     """
     tmp_dir = tempfile.gettempdir()
     tmp_id = str(uuid.uuid4())
     tmp_path = os.path.join(tmp_dir, tmp_id)
     
+    # ── 8K/4K FAST PATH: Use dedicated high-res downloader first ──
+    if req.format == "mp4" and int(req.quality) >= 2160:
+        try:
+            logger.info(f"🎬 8K/4K fast path: {req.url} quality={req.quality}")
+            progress_store[req.download_id] = {"status": "downloading", "progress": 5}
+            output_dir = os.path.join(tmp_dir, f"8k_{tmp_id}")
+            os.makedirs(output_dir, exist_ok=True)
+            out_file = await download_8k_video(
+                req.url, COOKIES_FILE, output_dir,
+                target_height=int(req.quality),
+                download_id=req.download_id
+            )
+            title = os.path.splitext(os.path.basename(out_file))[0]
+            safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip() or "video"
+            file_size = os.path.getsize(out_file)
+            filename_ext = os.path.splitext(out_file)[1].lstrip('.') or "mp4"
+            media_type = f"video/{filename_ext}" if filename_ext != "mkv" else "video/x-matroska"
+            
+            progress_store[req.download_id] = {"status": "streaming", "progress": 100}
+            headers = {
+                "Content-Disposition": f'attachment; filename="{safe_title}.{filename_ext}"',
+                "Content-Length": str(file_size),
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
+            }
+            background_tasks.add_task(cleanup_temp_file, out_file)
+
+            def iterfile_8k():
+                try:
+                    with open(out_file, "rb") as f:
+                        while chunk := f.read(8 * 1024 * 1024):  # 8MB chunks for large files
+                            yield chunk
+                finally:
+                    if os.path.exists(out_file):
+                        try:
+                            os.remove(out_file)
+                        except Exception:
+                            pass
+                    # Clean up the temp directory
+                    import shutil as _shutil
+                    try:
+                        _shutil.rmtree(output_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                    if req.download_id in progress_store:
+                        try:
+                            del progress_store[req.download_id]
+                        except Exception:
+                            pass
+
+            logger.info(f"✅ 8K/4K download success: {safe_title} ({file_size / 1024 / 1024:.1f} MB)")
+            return StreamingResponse(iterfile_8k(), media_type=media_type, headers=headers)
+        except Exception as e_8k:
+            logger.warning(f"8K/4K fast path failed ({str(e_8k)}), falling back to standard download...")
+            # Clean up failed 8K attempt
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(os.path.join(tmp_dir, f"8k_{tmp_id}"), ignore_errors=True)
+            except Exception:
+                pass
+
+    # ── STANDARD DOWNLOAD PATH ──
     try:
         # Build yt-dlp options based on request
         ydl_opts = {**get_base_ydl_opts(), "outtmpl": tmp_path + ".%(ext)s"}
@@ -1003,40 +1107,7 @@ async def download_video(req: DownloadRequest, request: Request, background_task
         )
 
     except Exception as e:
-        # Attempt direct 8K download via yt-dlp with aria2c
-        if req.format == "mp4" and int(req.quality) >= 4320:
-            try:
-                output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
-                os.makedirs(output_dir, exist_ok=True)
-                out_file = await download_8k_video(req.url, COOKIES_FILE, output_dir)
-                title = os.path.splitext(os.path.basename(out_file))[0]
-
-                # Stream the 8K file
-                progress_store[req.download_id] = {"status": "streaming", "progress": 100}
-                safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()
-                if not safe_title:
-                    safe_title = "video"
-                file_size = os.path.getsize(out_file)
-                headers = {
-                    "Content-Disposition": f'attachment; filename="{safe_title}.mp4"',
-                    "Content-Length": str(file_size),
-                    "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
-                }
-                background_tasks.add_task(cleanup_temp_file, out_file)
-
-                def iterfile_local():
-                    with open(out_file, "rb") as f:
-                        while chunk := f.read(4 * 1024 * 1024):
-                            yield chunk
-
-                return StreamingResponse(
-                    iterfile_local(),
-                    media_type="video/mp4",
-                    headers=headers
-                )
-            except Exception as e_8k:
-                logger.warning(f"Direct 8K yt-dlp download failed ({str(e_8k)}), falling back to other methods.")
-        # Original warning and processing status for fallback
+        # yt-dlp standard path failed, fall back to Invidious/Piped/Cobalt
         logger.warning(f"yt-dlp download failed ({str(e)}), entering self-healing streaming/download fallbacks...")
         progress_store[req.download_id] = {"status": "processing", "progress": 5}
         
