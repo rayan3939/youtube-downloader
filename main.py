@@ -1029,9 +1029,8 @@ async def download_video(req: DownloadRequest, request: Request, background_task
             })
         else:
             ydl_opts.update({
-                "format": f"bestvideo[ext=mp4][height<={req.quality}]+bestaudio[ext=m4a]/bestvideo[height<={req.quality}]+bestaudio/best",
+                "format": f"bestvideo[height<={req.quality}]+bestaudio/best[height<={req.quality}]/best",
                 "merge_output_format": "mp4",
-                "recode_video": "mp4",
             })
         ydl_opts["progress_hooks"] = [make_progress_hook(req.download_id)]
 
